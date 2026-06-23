@@ -1,0 +1,2398 @@
+# =============================================================
+#  PC9 — Radchenko Windows 82 (новая версия)
+#  Автор: Никита Радченко    GDScript-порт для Godot 4
+#  Узел: Control (корневой)
+#  Версия: 2.0  (DOS/CGA/AdLib эмулятор, новая редакция Pc8 -> Pc9)
+# =============================================================
+#
+#  Как подключить:
+#    1. Создай сцену, корневой узел — Control (на весь экран).
+#    2. Прикрепи этот скрипт к нему.
+#    3. Запусти сцену — появится рабочий стол PC9.
+#
+#  Архитектура:
+#    CPU8086      — процессор Intel 8086 (110+ команд + новые опкоды)
+#    MemoryBus    — 1 МБ ОЗУ (PackedByteArray) с безопасным доступом
+#    DOSKernel    — INT 21h / 20h / 10h / 11h / 12h / 15h / 16h / 1Ah
+#    CGADisplay   — видеорежим 320×200, 4 цвета
+#    AdLib/OPL2   — звуковая карта (FM-синтез, 9 каналов)
+#    DOSLoader    — загрузчик .COM и .EXE (MZ-header + relocation)
+#    KeyboardBuf  — буфер клавиш + BIOS INT 16h
+#    SystemTimer  — таймер 18.2 Гц (BIOS 0x40:0x6C)
+#    DesktopUI    — рабочий стол, панель задач, меню Пуск
+#    PowerShell   — встроенный терминал
+#
+#  Что нового по сравнению с PC8:
+#    - INT 11h (опрос оборудования) и INT 12h (объём памяти)
+#    - INT 15h (микрозадержки, джойстик, расширенная память)
+#    - INT 1Ah (системные часы / генератор случайных чисел)
+#    - Звуковая карта AdLib/OPL2 (порты 0x388/0x389) с реальным
+#      FM-синтезом через AudioStreamGenerator
+#    - Новые опкоды x86: PUSH imm8/imm16 (0x6A/0x68),
+#      ENTER/LEAVE (0xC8/0xC9), AAA/DAS (0x37/0x2F)
+#    - Безопасные функции доступа к памяти (защита от выхода
+#      за пределы ОЗУ во всех новых блоках)
+#    - Деление на ноль теперь вызывает настоящее INT 00h,
+#      а не безусловный cpu_halt
+# =============================================================
+
+extends Control
+
+# ──────────────────────────────────────────────────────────────
+#  КОНСТАНТЫ
+# ──────────────────────────────────────────────────────────────
+const RAM_SIZE      : int = 1024 * 1024   # 1 МБ
+const CGA_VRAM      : int = 0xB8000       # Адрес видеопамяти
+const CGA_W         : int = 320
+const CGA_H         : int = 200
+const TIMER_ADDR    : int = 0x46C         # BIOS tick-counter
+const LOAD_SEGMENT  : int = 0x0B00        # Сегмент загрузки
+const PSP_SIZE      : int = 256
+
+const REG16 : Array[String] = ["AX","CX","DX","BX","SP","BP","SI","DI"]
+const REG8  : Array[String] = ["AL","CL","DL","BL","AH","CH","DH","BH"]
+
+# CGA палитра №1 (Color)
+const CGA_PALETTE : Array[Color] = [
+	Color(0,0,0),
+	Color(0.333,1,1),
+	Color(1,0.333,1),
+	Color(1,1,1)
+]
+
+# ──────────────────────────────────────────────────────────────
+#  СОСТОЯНИЕ ЯЗЫКА
+# ──────────────────────────────────────────────────────────────
+var lang : String = "RU"
+
+const LANGS : Dictionary = {
+	"RU": {
+		"title":      "PC9 — Radchenko Windows 82",
+		"welcome":    "Система PC9 готова к работе",
+		"start":      "Пуск",
+		"shutdown":   "Завершить работу",
+		"powershell": "Администратор: PowerShell",
+		"run_game":   "Запустить игру (.COM / .EXE)",
+		"display":    "Дисплей CGA",
+		"lang_btn":   "Язык: RU",
+		"ps_banner":  "PC9 PowerShell [Version 2.0]\n(c) 1982 Корпорация Radchenko.\n\nPS C:\\PC9> ",
+		"about":      "PC9 — Radchenko Windows 82\nВерсия 2.0\nАвтор: Никита Радченко\n\nЭмулятор DOS / Intel 8086\n110+ команд x86, CGA 320×200, AdLib OPL2",
+	},
+	"EN": {
+		"title":      "PC9 — Radchenko Windows 82",
+		"welcome":    "PC9 System is ready",
+		"start":      "Start",
+		"shutdown":   "Shutdown",
+		"powershell": "Administrator: PowerShell",
+		"run_game":   "Run game (.COM / .EXE)",
+		"display":    "CGA Display",
+		"lang_btn":   "Lang: EN",
+		"ps_banner":  "PC9 PowerShell [Version 2.0]\n(c) 1982 Radchenko Corporation.\n\nPS C:\\PC9> ",
+		"about":      "PC9 — Radchenko Windows 82\nVersion 2.0\nAuthor: Nikita Radchenko\n\nDOS / Intel 8086 Emulator\n110+ x86 commands, CGA 320×200, AdLib OPL2",
+	}
+}
+
+func L(key: String) -> String:
+	return LANGS[lang].get(key, key)
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 1 — ПАМЯТЬ (с безопасными функциями доступа)
+# ══════════════════════════════════════════════════════════════
+var memory : PackedByteArray
+
+func mem_init() -> void:
+	memory = PackedByteArray()
+	memory.resize(RAM_SIZE)
+	memory.fill(0)
+
+func mem_rb(seg: int, off: int) -> int:
+	var addr : int = ((seg << 4) + (off & 0xFFFF)) & 0xFFFFF
+	return memory[addr]
+
+func mem_wb(seg: int, off: int, val: int) -> void:
+	var addr : int = ((seg << 4) + (off & 0xFFFF)) & 0xFFFFF
+	memory[addr] = val & 0xFF
+
+func mem_rw(seg: int, off: int) -> int:
+	var addr : int = ((seg << 4) + (off & 0xFFFF)) & 0xFFFFF
+	var addr2 : int = ((seg << 4) + ((off + 1) & 0xFFFF)) & 0xFFFFF
+	return memory[addr] | (memory[addr2] << 8)
+
+func mem_ww(seg: int, off: int, val: int) -> void:
+	var addr : int = ((seg << 4) + (off & 0xFFFF)) & 0xFFFFF
+	var addr2 : int = ((seg << 4) + ((off + 1) & 0xFFFF)) & 0xFFFFF
+	memory[addr]  = val & 0xFF
+	memory[addr2] = (val >> 8) & 0xFF
+
+func mem_get_phys(seg_val: int, off: int) -> int:
+	return ((seg_val << 4) + (off & 0xFFFF)) & 0xFFFFF
+
+# Безопасная запись/чтение по уже посчитанному физическому адресу
+# (используется новым кодом загрузчика и подсистемами PC9, защищает
+# от выхода за пределы массива memory при любых вычислениях адреса)
+func safe_write_8(phys_addr: int, val: int) -> void:
+	var addr : int = phys_addr & 0xFFFFF
+	if addr < memory.size():
+		memory[addr] = val & 0xFF
+
+func safe_write_16(phys_addr: int, val: int) -> void:
+	safe_write_8(phys_addr, val & 0xFF)
+	safe_write_8(phys_addr + 1, (val >> 8) & 0xFF)
+
+func safe_read_8(phys_addr: int) -> int:
+	var addr : int = phys_addr & 0xFFFFF
+	if addr < memory.size():
+		return memory[addr]
+	return 0
+
+func safe_read_16(phys_addr: int) -> int:
+	var lo : int = safe_read_8(phys_addr)
+	var hi : int = safe_read_8(phys_addr + 1)
+	return lo | (hi << 8)
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 2 — ПРОЦЕССОР Intel 8086
+# ══════════════════════════════════════════════════════════════
+
+# ── Регистры ──────────────────────────────────────────────────
+var cpu_regs : Dictionary = {
+	"AX":0,"CX":0,"DX":0,"BX":0,
+	"SP":0xFFFE,"BP":0,"SI":0,"DI":0
+}
+var cpu_segs : Dictionary = {
+	"CS":LOAD_SEGMENT,"DS":LOAD_SEGMENT,
+	"SS":LOAD_SEGMENT,"ES":LOAD_SEGMENT
+}
+var cpu_ip   : int = 0x0100
+var cpu_halt : bool = false
+
+var cpu_flags : Dictionary = {
+	"CF":0,"ZF":0,"SF":0,"OF":0,"PF":0,"IF":1,"DF":0,"AF":0
+}
+
+var cpu_seg_override : int = -1   # -1 = нет переопределения
+var cpu_keyboard_buf : Array = []  # Array of [ascii, scan]
+var cpu_file_handles : Dictionary = {}  # fd -> FileAccess
+
+# ── Fetch ──────────────────────────────────────────────────────
+func cpu_fetch_b() -> int:
+	var v : int = mem_rb(cpu_segs["CS"], cpu_ip)
+	cpu_ip = (cpu_ip + 1) & 0xFFFF
+	return v
+
+func cpu_fetch_w() -> int:
+	var lo : int = cpu_fetch_b()
+	var hi : int = cpu_fetch_b()
+	return lo | (hi << 8)
+
+func cpu_fetch_sb() -> int:
+	var v : int = cpu_fetch_b()
+	return v - 256 if v & 0x80 else v
+
+func cpu_fetch_sw() -> int:
+	var v : int = cpu_fetch_w()
+	return v - 65536 if v & 0x8000 else v
+
+# ── Регистры 8-бит ────────────────────────────────────────────
+func cpu_get_r8(idx: int) -> int:
+	var reg : String = REG16[idx % 4]
+	if idx >= 4:
+		return (cpu_regs[reg] >> 8) & 0xFF
+	return cpu_regs[reg] & 0xFF
+
+func cpu_set_r8(idx: int, val: int) -> void:
+	var reg : String = REG16[idx % 4]
+	if idx >= 4:
+		cpu_regs[reg] = (cpu_regs[reg] & 0x00FF) | ((val & 0xFF) << 8)
+	else:
+		cpu_regs[reg] = (cpu_regs[reg] & 0xFF00) | (val & 0xFF)
+
+# ── Адресация с учётом seg_override ───────────────────────────
+func cpu_get_phys(seg_name: String, off: int) -> int:
+	var seg_val : int
+	if cpu_seg_override >= 0 and seg_name == "DS":
+		seg_val = cpu_seg_override
+	else:
+		seg_val = cpu_segs[seg_name]
+	return ((seg_val << 4) + (off & 0xFFFF)) & 0xFFFFF
+
+func cpu_rb(seg: String, off: int) -> int:
+	return memory[cpu_get_phys(seg, off)]
+
+func cpu_wb(seg: String, off: int, val: int) -> void:
+	memory[cpu_get_phys(seg, off)] = val & 0xFF
+
+func cpu_rw(seg: String, off: int) -> int:
+	var a1 : int = cpu_get_phys(seg, off)
+	var a2 : int = cpu_get_phys(seg, (off + 1) & 0xFFFF)
+	return memory[a1] | (memory[a2] << 8)
+
+func cpu_ww(seg: String, off: int, val: int) -> void:
+	var a1 : int = cpu_get_phys(seg, off)
+	var a2 : int = cpu_get_phys(seg, (off + 1) & 0xFFFF)
+	memory[a1] = val & 0xFF
+	memory[a2] = (val >> 8) & 0xFF
+
+# ── Флаги ─────────────────────────────────────────────────────
+func cpu_upd_flags(res: int, size: int = 16, sub: bool = false, a: int = 0, b: int = 0) -> void:
+	var mask : int = 0xFFFF if size == 16 else 0xFF
+	var sign : int = 0x8000 if size == 16 else 0x80
+	var r    : int = res & mask
+	cpu_flags["ZF"] = 1 if r == 0 else 0
+	cpu_flags["SF"] = 1 if (r & sign) != 0 else 0
+	var bits : int = r & 0xFF
+	var cnt  : int = 0
+	while bits:
+		cnt += bits & 1
+		bits >>= 1
+	cpu_flags["PF"] = 1 if cnt % 2 == 0 else 0
+	if sub:
+		cpu_flags["CF"] = 1 if a < b else 0
+		cpu_flags["OF"] = 1 if ((a ^ b) & sign) != 0 and ((a ^ r) & sign) != 0 else 0
+		cpu_flags["AF"] = 1 if (a & 0xF) < (b & 0xF) else 0
+	else:
+		cpu_flags["CF"] = 1 if res > mask else 0
+		cpu_flags["OF"] = 1 if ((a ^ b) & sign) == 0 and ((a ^ r) & sign) != 0 else 0
+		cpu_flags["AF"] = 1 if ((a & 0xF) + (b & 0xF)) > 0xF else 0
+
+# ── Стек ──────────────────────────────────────────────────────
+func cpu_push(val: int) -> void:
+	cpu_regs["SP"] = (cpu_regs["SP"] - 2) & 0xFFFF
+	cpu_ww("SS", cpu_regs["SP"], val)
+
+func cpu_pop() -> int:
+	var v : int = cpu_rw("SS", cpu_regs["SP"])
+	cpu_regs["SP"] = (cpu_regs["SP"] + 2) & 0xFFFF
+	return v
+
+# ── Декодер ModR/M ────────────────────────────────────────────
+func cpu_decode_modrm(word: bool = true) -> Dictionary:
+	var byte : int = cpu_fetch_b()
+	var mod  : int = (byte >> 6) & 3
+	var reg  : int = (byte >> 3) & 7
+	var rm   : int =  byte       & 7
+
+	if mod == 3:
+		return {"mem": false, "reg": reg, "rm": rm, "word": word}
+
+	var base : int = 0
+	var seg  : String = "DS"
+
+	match rm:
+		0: base = cpu_regs["BX"] + cpu_regs["SI"]
+		1: base = cpu_regs["BX"] + cpu_regs["DI"]
+		2: base = cpu_regs["BP"] + cpu_regs["SI"]; seg = "SS"
+		3: base = cpu_regs["BP"] + cpu_regs["DI"]; seg = "SS"
+		4: base = cpu_regs["SI"]
+		5: base = cpu_regs["DI"]
+		6:
+			if mod == 0:
+				base = cpu_fetch_w()
+			else:
+				base = cpu_regs["BP"]; seg = "SS"
+		7: base = cpu_regs["BX"]
+
+	var disp : int = 0
+	if   mod == 1: disp = cpu_fetch_sb()
+	elif mod == 2: disp = cpu_fetch_w()
+
+	var off : int = (base + disp) & 0xFFFF
+	return {"mem": true, "reg": reg, "seg": seg, "off": off, "word": word}
+
+func cpu_get_rm(m: Dictionary) -> int:
+	if not m["mem"]:
+		if m["word"]: return cpu_regs[REG16[m["rm"]]]
+		else:         return cpu_get_r8(m["rm"])
+	if m["word"]: return cpu_rw(m["seg"], m["off"])
+	return cpu_rb(m["seg"], m["off"])
+
+func cpu_set_rm(m: Dictionary, val: int) -> void:
+	if not m["mem"]:
+		if m["word"]: cpu_regs[REG16[m["rm"]]] = val & 0xFFFF
+		else:         cpu_set_r8(m["rm"], val)
+	else:
+		if m["word"]: cpu_ww(m["seg"], m["off"], val)
+		else:         cpu_wb(m["seg"], m["off"], val)
+
+func cpu_get_reg(m: Dictionary) -> int:
+	if m["word"]: return cpu_regs[REG16[m["reg"]]]
+	return cpu_get_r8(m["reg"])
+
+func cpu_set_reg(m: Dictionary, val: int) -> void:
+	if m["word"]: cpu_regs[REG16[m["reg"]]] = val & 0xFFFF
+	else:         cpu_set_r8(m["reg"], val)
+
+# ── ALU ───────────────────────────────────────────────────────
+func cpu_alu(op_id: int, dst: int, src: int, size: int = 16) -> int:
+	var r    : int = 0
+	var mask : int = 0xFFFF if size == 16 else 0xFF
+	match op_id:
+		0: r = dst + src;           cpu_upd_flags(r, size, false, dst, src)  # ADD
+		1:                                                                      # OR
+			r = dst | src
+			cpu_upd_flags(r, size)
+			cpu_flags["CF"] = 0; cpu_flags["OF"] = 0
+		2: r = dst + src + cpu_flags["CF"]; cpu_upd_flags(r, size, false, dst, src)  # ADC
+		3: r = dst - src - cpu_flags["CF"]; cpu_upd_flags(r, size, true,  dst, src)  # SBB
+		4:                                                                      # AND
+			r = dst & src
+			cpu_upd_flags(r, size)
+			cpu_flags["CF"] = 0; cpu_flags["OF"] = 0
+		5: r = dst - src; cpu_upd_flags(r, size, true, dst, src)              # SUB
+		6:                                                                      # XOR
+			r = dst ^ src
+			cpu_upd_flags(r, size)
+			cpu_flags["CF"] = 0; cpu_flags["OF"] = 0
+		7:                                                                      # CMP
+			r = dst - src
+			cpu_upd_flags(r, size, true, dst, src)
+			return dst   # не пишем результат
+	return r & mask
+
+# ── Строковые команды ─────────────────────────────────────────
+func cpu_stosb() -> void:
+	cpu_wb("ES", cpu_regs["DI"], cpu_regs["AX"] & 0xFF)
+	var step : int = -1 if cpu_flags["DF"] else 1
+	cpu_regs["DI"] = (cpu_regs["DI"] + step) & 0xFFFF
+
+func cpu_stosw() -> void:
+	cpu_ww("ES", cpu_regs["DI"], cpu_regs["AX"])
+	var step : int = -2 if cpu_flags["DF"] else 2
+	cpu_regs["DI"] = (cpu_regs["DI"] + step) & 0xFFFF
+
+func cpu_lodsb() -> void:
+	cpu_set_r8(0, cpu_rb("DS", cpu_regs["SI"]))
+	var step : int = -1 if cpu_flags["DF"] else 1
+	cpu_regs["SI"] = (cpu_regs["SI"] + step) & 0xFFFF
+
+func cpu_lodsw() -> void:
+	cpu_regs["AX"] = cpu_rw("DS", cpu_regs["SI"])
+	var step : int = -2 if cpu_flags["DF"] else 2
+	cpu_regs["SI"] = (cpu_regs["SI"] + step) & 0xFFFF
+
+func cpu_movsb() -> void:
+	cpu_wb("ES", cpu_regs["DI"], cpu_rb("DS", cpu_regs["SI"]))
+	var step : int = -1 if cpu_flags["DF"] else 1
+	cpu_regs["SI"] = (cpu_regs["SI"] + step) & 0xFFFF
+	cpu_regs["DI"] = (cpu_regs["DI"] + step) & 0xFFFF
+
+func cpu_movsw() -> void:
+	cpu_ww("ES", cpu_regs["DI"], cpu_rw("DS", cpu_regs["SI"]))
+	var step : int = -2 if cpu_flags["DF"] else 2
+	cpu_regs["SI"] = (cpu_regs["SI"] + step) & 0xFFFF
+	cpu_regs["DI"] = (cpu_regs["DI"] + step) & 0xFFFF
+
+func cpu_scasb() -> void:
+	var al  : int = cpu_regs["AX"] & 0xFF
+	var mem_val : int = cpu_rb("ES", cpu_regs["DI"])
+	var r   : int = al - mem_val
+	cpu_upd_flags(r, 8, true, al, mem_val)
+	var step : int = -1 if cpu_flags["DF"] else 1
+	cpu_regs["DI"] = (cpu_regs["DI"] + step) & 0xFFFF
+
+# ═════════════════════════════════════════════════════════════
+#  ИСПОЛНЕНИЕ ОПКОДОВ
+# ═════════════════════════════════════════════════════════════
+
+func cpu_step() -> void:
+	if cpu_halt:
+		return
+	var op : int = cpu_fetch_b()
+	cpu_exec(op)
+
+func cpu_exec(op: int) -> void:
+	# ── MOV reg, imm ──────────────────────────────────────────
+	if op >= 0xB0 and op <= 0xBF:
+		var idx : int = op & 7
+		if op & 8:
+			cpu_regs[REG16[idx]] = cpu_fetch_w()
+		else:
+			cpu_set_r8(idx, cpu_fetch_b())
+		return
+
+	# ── INC/DEC reg16 (0x40-0x4F) ────────────────────────────
+	if op >= 0x40 and op <= 0x4F:
+		var reg : String = REG16[op & 7]
+		var old_cf : int = cpu_flags["CF"]
+		var r : int
+		if op < 0x48:
+			r = (cpu_regs[reg] + 1) & 0xFFFF
+			cpu_upd_flags(r, 16, false, cpu_regs[reg], 1)
+		else:
+			r = (cpu_regs[reg] - 1) & 0xFFFF
+			cpu_upd_flags(r, 16, true, cpu_regs[reg], 1)
+		cpu_flags["CF"] = old_cf
+		cpu_regs[reg] = r
+		return
+
+	# ── PUSH reg16 (0x50-0x57) ───────────────────────────────
+	if op >= 0x50 and op <= 0x57:
+		cpu_push(cpu_regs[REG16[op & 7]])
+		return
+
+	# ── POP reg16 (0x58-0x5F) ────────────────────────────────
+	if op >= 0x58 and op <= 0x5F:
+		cpu_regs[REG16[op & 7]] = cpu_pop()
+		return
+
+	# ── XCHG AX, reg (0x91-0x97) ─────────────────────────────
+	if op >= 0x91 and op <= 0x97:
+		var tmp : int = cpu_regs["AX"]
+		cpu_regs["AX"] = cpu_regs[REG16[op & 7]]
+		cpu_regs[REG16[op & 7]] = tmp
+		return
+
+	# ── Jcc (0x70-0x7F) ──────────────────────────────────────
+	if op >= 0x70 and op <= 0x7F:
+		_op_jcc(op)
+		return
+
+	# ── ALU группы (0x00-0x3F) ───────────────────────────────
+	if op <= 0x3F:
+		# AAA (0x37) и DAS (0x2F) — особые случаи внутри диапазона ALU
+		if op == 0x37:
+			_op_aaa()
+			return
+		if op == 0x2F:
+			_op_das()
+			return
+		var grp  : int  = (op >> 3) & 7
+		var word : bool = bool(op & 1)
+		var sub_op : int = op & 7
+		if sub_op <= 1:          # RM ← REG
+			var m : Dictionary = cpu_decode_modrm(word)
+			var dst : int = cpu_get_rm(m)
+			var src : int = cpu_get_reg(m)
+			var res : int = cpu_alu(grp, dst, src, 16 if word else 8)
+			if grp != 7: cpu_set_rm(m, res)
+		elif sub_op <= 3:        # REG ← RM
+			var m : Dictionary = cpu_decode_modrm(word)
+			var dst : int = cpu_get_reg(m)
+			var src : int = cpu_get_rm(m)
+			var res : int = cpu_alu(grp, dst, src, 16 if word else 8)
+			if grp != 7: cpu_set_reg(m, res)
+		elif sub_op <= 5:        # AX/AL ← imm
+			if word:
+				var src : int = cpu_fetch_w()
+				var res : int = cpu_alu(grp, cpu_regs["AX"], src, 16)
+				if grp != 7: cpu_regs["AX"] = res
+			else:
+				var src : int = cpu_fetch_b()
+				var al  : int = cpu_regs["AX"] & 0xFF
+				var res : int = cpu_alu(grp, al, src, 8)
+				if grp != 7: cpu_set_r8(0, res)
+		return
+
+	# ── Большой switch по опкоду ──────────────────────────────
+	match op:
+		# ─ NOP / HLT ─────────────────────────────────────────
+		0x90: pass   # NOP
+		0xF4: cpu_halt = true   # HLT
+
+		# ─ Флаги ─────────────────────────────────────────────
+		0xF8: cpu_flags["CF"] = 0   # CLC
+		0xF9: cpu_flags["CF"] = 1   # STC
+		0xF5: cpu_flags["CF"] ^= 1  # CMC
+		0xFA: cpu_flags["IF"] = 0   # CLI
+		0xFB: cpu_flags["IF"] = 1   # STI
+		0xFC: cpu_flags["DF"] = 0   # CLD
+		0xFD: cpu_flags["DF"] = 1   # STD
+
+		# ─ MOV r/m, reg ──────────────────────────────────────
+		0x88, 0x89:
+			var m : Dictionary = cpu_decode_modrm(op == 0x89)
+			cpu_set_rm(m, cpu_get_reg(m))
+		0x8A, 0x8B:
+			var m : Dictionary = cpu_decode_modrm(op == 0x8B)
+			cpu_set_reg(m, cpu_get_rm(m))
+
+		# ─ MOV seg ───────────────────────────────────────────
+		0x8C:
+			var m : Dictionary = cpu_decode_modrm(true)
+			var seg_names : Array[String] = ["ES","CS","SS","DS"]
+			cpu_set_rm(m, cpu_segs[seg_names[m["reg"] & 3]])
+		0x8E:
+			var m : Dictionary = cpu_decode_modrm(true)
+			var seg_names : Array[String] = ["ES","CS","SS","DS"]
+			cpu_segs[seg_names[m["reg"] & 3]] = cpu_get_rm(m)
+
+		# ─ MOV AX,[mem] / [mem],AX ───────────────────────────
+		0xA1:
+			cpu_regs["AX"] = cpu_rw("DS", cpu_fetch_w())
+		0xA3:
+			cpu_ww("DS", cpu_fetch_w(), cpu_regs["AX"])
+
+		# ─ MOV r/m, imm ──────────────────────────────────────
+		0xC6:
+			var m : Dictionary = cpu_decode_modrm(false)
+			cpu_set_rm(m, cpu_fetch_b())
+		0xC7:
+			var m : Dictionary = cpu_decode_modrm(true)
+			cpu_set_rm(m, cpu_fetch_w())
+
+		# ─ Группа 1: ALU r/m, imm ────────────────────────────
+		0x80, 0x81, 0x83:
+			_op_group1(op)
+
+		# ─ Сегментные регистры ───────────────────────────────
+		0x06: cpu_push(cpu_segs["ES"])
+		0x07: cpu_segs["ES"] = cpu_pop()
+		0x0E: cpu_push(cpu_segs["CS"])
+		0x16: cpu_push(cpu_segs["SS"])
+		0x17: cpu_segs["SS"] = cpu_pop()
+		0x1E: cpu_push(cpu_segs["DS"])
+		0x1F: cpu_segs["DS"] = cpu_pop()
+
+		# ─ TEST ──────────────────────────────────────────────
+		0x84, 0x85:
+			var m : Dictionary = cpu_decode_modrm(op == 0x85)
+			var res : int = cpu_get_rm(m) & cpu_get_reg(m)
+			cpu_upd_flags(res, 16 if op == 0x85 else 8)
+			cpu_flags["CF"] = 0; cpu_flags["OF"] = 0
+		0xA8:
+			var res : int = (cpu_regs["AX"] & 0xFF) & cpu_fetch_b()
+			cpu_upd_flags(res, 8)
+			cpu_flags["CF"] = 0; cpu_flags["OF"] = 0
+		0xA9:
+			var res : int = cpu_regs["AX"] & cpu_fetch_w()
+			cpu_upd_flags(res, 16)
+			cpu_flags["CF"] = 0; cpu_flags["OF"] = 0
+
+		# ─ XCHG r/m, reg ─────────────────────────────────────
+		0x86, 0x87:
+			var m : Dictionary = cpu_decode_modrm(op == 0x87)
+			var tmp : int = cpu_get_rm(m)
+			cpu_set_rm(m, cpu_get_reg(m))
+			cpu_set_reg(m, tmp)
+
+		# ─ LEA ───────────────────────────────────────────────
+		0x8D:
+			var m : Dictionary = cpu_decode_modrm(true)
+			if m["mem"]:
+				cpu_regs[REG16[m["reg"]]] = m["off"]
+
+		# ─ LDS / LES ─────────────────────────────────────────
+		0xC4, 0xC5:
+			var m : Dictionary = cpu_decode_modrm(true)
+			if m["mem"]:
+				var off_v : int = cpu_rw(m["seg"], m["off"])
+				var seg_v : int = cpu_rw(m["seg"], (m["off"] + 2) & 0xFFFF)
+				cpu_regs[REG16[m["reg"]]] = off_v
+				if op == 0xC5: cpu_segs["DS"] = seg_v
+				else:          cpu_segs["ES"] = seg_v
+
+		# ─ BOUND (0x62) ──────────────────────────────────────
+		0x62:
+			_op_bound()
+
+		# ─ CALL near ─────────────────────────────────────────
+		0xE8:
+			var off_v : int = cpu_fetch_sw()
+			cpu_push(cpu_ip)
+			cpu_ip = (cpu_ip + off_v) & 0xFFFF
+
+		# ─ RET ───────────────────────────────────────────────
+		0xC3: cpu_ip = cpu_pop()
+		0xC2:
+			var n : int = cpu_fetch_w()
+			cpu_ip = cpu_pop()
+			cpu_regs["SP"] = (cpu_regs["SP"] + n) & 0xFFFF
+		0xCB:   # RETF
+			cpu_ip = cpu_pop()
+			cpu_segs["CS"] = cpu_pop()
+
+		# ─ JMP ───────────────────────────────────────────────
+		0xEB:
+			cpu_ip = (cpu_ip + cpu_fetch_sb()) & 0xFFFF
+		0xE9:
+			cpu_ip = (cpu_ip + cpu_fetch_sw()) & 0xFFFF
+		0xEA:   # JMP far
+			var off_v2 : int = cpu_fetch_w()
+			var seg_v2 : int = cpu_fetch_w()
+			cpu_ip = off_v2
+			cpu_segs["CS"] = seg_v2
+
+		# ─ LOOP ──────────────────────────────────────────────
+		0xE0, 0xE1, 0xE2:
+			_op_loop(op)
+		0xE3:
+			var off_v3 : int = cpu_fetch_sb()
+			if cpu_regs["CX"] == 0:
+				cpu_ip = (cpu_ip + off_v3) & 0xFFFF
+
+		# ─ INT ───────────────────────────────────────────────
+		0xCC: cpu_handle_interrupt(3)
+		0xCD: cpu_handle_interrupt(cpu_fetch_b())
+		0xCE:
+			if cpu_flags["OF"]:
+				cpu_handle_interrupt(4)
+		0xCF:   # IRET
+			cpu_ip = cpu_pop()
+			cpu_segs["CS"] = cpu_pop()
+			var fw : int = cpu_pop()
+			var iret_names : Array[String] = ["CF","","PF","","AF","","ZF","SF","TF","IF","DF","OF"]
+			for i in range(iret_names.size()):
+				if iret_names[i] != "":
+					cpu_flags[iret_names[i]] = (fw >> i) & 1
+
+		# ─ Сдвиги группы 2 ───────────────────────────────────
+		0xD0, 0xD1, 0xD2, 0xD3:
+			_op_group2_shift(op)
+
+		# ─ Группа 3 ──────────────────────────────────────────
+		0xF6, 0xF7:
+			_op_group3(op)
+
+		# ─ Группа 4/5 ────────────────────────────────────────
+		0xFE: _op_group4()
+		0xFF: _op_group5()
+
+		# ─ Строковые команды ─────────────────────────────────
+		0xA4: cpu_movsb()
+		0xA5: cpu_movsw()
+		0xAA: cpu_stosb()
+		0xAB: cpu_stosw()
+		0xAC: cpu_lodsb()
+		0xAD: cpu_lodsw()
+		0xAE: cpu_scasb()
+
+		# ─ REP / REPNE ───────────────────────────────────────
+		0xF2, 0xF3: _op_rep(op)
+
+		# ─ Сегментные префиксы ───────────────────────────────
+		0x26: _op_seg_prefix(cpu_segs["ES"])
+		0x2E: _op_seg_prefix(cpu_segs["CS"])
+		0x36: _op_seg_prefix(cpu_segs["SS"])
+		0x3E: _op_seg_prefix(cpu_segs["DS"])
+
+		# ─ IN / OUT ──────────────────────────────────────────
+		0xE4: cpu_set_r8(0, _in_port(cpu_fetch_b()))
+		0xE5: cpu_regs["AX"] = _in_port(cpu_fetch_b())
+		0xEC: cpu_set_r8(0, _in_port(cpu_regs["DX"]))
+		0xED: cpu_regs["AX"] = _in_port(cpu_regs["DX"])
+		0xE6: _out_port(cpu_fetch_b(), cpu_regs["AX"] & 0xFF)
+		0xE7: _out_port(cpu_fetch_b(), cpu_regs["AX"])
+		0xEE: _out_port(cpu_regs["DX"], cpu_regs["AX"] & 0xFF)
+		0xEF: _out_port(cpu_regs["DX"], cpu_regs["AX"])
+
+		# ─ PUSH immediate (новое: 80186-стиль, добавлено в PC9) ─
+		0x6A:   # PUSH imm8 (знаковое расширение до 16 бит)
+			var v8 : int = cpu_fetch_sb()
+			cpu_push(v8 & 0xFFFF)
+		0x68:   # PUSH imm16
+			var v16 : int = cpu_fetch_w()
+			cpu_push(v16)
+
+		# ─ ENTER / LEAVE (новое: удобно для скомпилированных
+		#   программ на Си, добавлено в PC9) ──────────────────
+		0xC8:   # ENTER imm16, imm8
+			var alloc_size : int = cpu_fetch_w()
+			var nesting    : int = cpu_fetch_b() & 0x1F
+			cpu_push(cpu_regs["BP"])
+			var frame_temp : int = cpu_regs["SP"]
+			if nesting > 0:
+				for lvl in range(1, nesting):
+					cpu_regs["BP"] = (cpu_regs["BP"] - 2) & 0xFFFF
+					cpu_push(cpu_rw("SS", cpu_regs["BP"]))
+				cpu_push(frame_temp)
+			cpu_regs["BP"] = frame_temp
+			cpu_regs["SP"] = (cpu_regs["SP"] - alloc_size) & 0xFFFF
+		0xC9:   # LEAVE
+			cpu_regs["SP"] = cpu_regs["BP"]
+			cpu_regs["BP"] = cpu_pop()
+
+		# ─ Прочее ────────────────────────────────────────────
+		0xD4: _op_aam()
+		0xD5: _op_aad()
+		0x98: _op_cbw()
+		0x99: _op_cwd()
+		0xD7: _op_xlat()
+		0x9C: _op_pushf()
+		0x9D: _op_popf()
+		0x9E: _op_sahf()
+		0x9F: _op_lahf()
+
+		_:
+			print("[CPU ERR] Неизвестный опкод 0x%02X на CS:IP=%04X:%04X" % [
+				op, cpu_segs["CS"], (cpu_ip - 1) & 0xFFFF])
+			cpu_handle_interrupt(0x06)   # PC9: недопустимый опкод -> INT 06h
+
+# ── Группа 1 ──────────────────────────────────────────────────
+func _op_group1(op: int) -> void:
+	var word : bool = (op != 0x80)
+	var m    : Dictionary = cpu_decode_modrm(word)
+	var imm  : int
+	if op == 0x81:
+		imm = cpu_fetch_w()
+	elif op == 0x83:
+		imm = cpu_fetch_sb()
+		if imm < 0: imm &= 0xFFFF
+	else:
+		imm = cpu_fetch_b()
+	var dst : int = cpu_get_rm(m)
+	var res : int = cpu_alu(m["reg"], dst, imm, 16 if word else 8)
+	if m["reg"] != 7:
+		cpu_set_rm(m, res)
+
+# ── Группа 2: сдвиги ──────────────────────────────────────────
+func _op_group2_shift(op: int) -> void:
+	var word  : bool = bool(op & 1)
+	var m     : Dictionary = cpu_decode_modrm(word)
+	var count : int = 1 if op < 0xD2 else (cpu_regs["CX"] & 0xFF)
+	var val   : int = cpu_get_rm(m)
+	var ext   : int = m["reg"]
+	var size  : int = 16 if word else 8
+	var mask  : int = 0xFFFF if word else 0xFF
+
+	for _i in range(count & 0x1F):
+		match ext:
+			4:   # SHL
+				cpu_flags["CF"] = (val >> (size - 1)) & 1
+				val = (val << 1) & mask
+			5:   # SHR
+				cpu_flags["CF"] = val & 1
+				val = (val >> 1) & mask
+			7:   # SAR
+				cpu_flags["CF"] = val & 1
+				var sign : int = val & (1 << (size - 1))
+				val = ((val >> 1) | sign) & mask
+			0:   # ROL
+				cpu_flags["CF"] = (val >> (size - 1)) & 1
+				val = ((val << 1) | cpu_flags["CF"]) & mask
+			1:   # ROR
+				cpu_flags["CF"] = val & 1
+				val = ((cpu_flags["CF"] << (size - 1)) | (val >> 1)) & mask
+			2:   # RCL
+				var nc : int = (val >> (size - 1)) & 1
+				val = ((val << 1) | cpu_flags["CF"]) & mask
+				cpu_flags["CF"] = nc
+			3:   # RCR
+				var nc2 : int = val & 1
+				val = ((cpu_flags["CF"] << (size - 1)) | (val >> 1)) & mask
+				cpu_flags["CF"] = nc2
+
+	cpu_upd_flags(val, size)
+	cpu_set_rm(m, val)
+
+# ── Группа 3 ──────────────────────────────────────────────────
+func _op_group3(op: int) -> void:
+	var word : bool = bool(op & 1)
+	var m    : Dictionary = cpu_decode_modrm(word)
+	var val  : int = cpu_get_rm(m)
+	var ext  : int = m["reg"]
+	var mask : int = 0xFFFF if word else 0xFF
+
+	match ext:
+		0:   # TEST r/m, imm
+			var imm : int = cpu_fetch_w() if word else cpu_fetch_b()
+			var res : int = val & imm
+			cpu_upd_flags(res, 16 if word else 8)
+			cpu_flags["CF"] = 0; cpu_flags["OF"] = 0
+		2:   # NOT
+			cpu_set_rm(m, (~val) & mask)
+		3:   # NEG
+			var res2 : int = (-val) & mask
+			cpu_set_rm(m, res2)
+			cpu_upd_flags(res2, 16 if word else 8, true, 0, val)
+			cpu_flags["CF"] = 1 if val != 0 else 0
+		4:   # MUL
+			if word:
+				var r : int = cpu_regs["AX"] * val
+				cpu_regs["AX"] = r & 0xFFFF
+				cpu_regs["DX"] = (r >> 16) & 0xFFFF
+				cpu_flags["CF"] = 1 if cpu_regs["DX"] != 0 else 0
+				cpu_flags["OF"] = cpu_flags["CF"]
+			else:
+				var r2 : int = (cpu_regs["AX"] & 0xFF) * val
+				cpu_regs["AX"] = r2 & 0xFFFF
+				cpu_flags["CF"] = 1 if r2 > 0xFF else 0
+				cpu_flags["OF"] = cpu_flags["CF"]
+		5:   # IMUL
+			if word:
+				var a : int = cpu_regs["AX"] if cpu_regs["AX"] < 0x8000 else cpu_regs["AX"] - 0x10000
+				var b : int = val if val < 0x8000 else val - 0x10000
+				var r3 : int = a * b
+				cpu_regs["AX"] = r3 & 0xFFFF
+				cpu_regs["DX"] = (r3 >> 16) & 0xFFFF
+			else:
+				var a8 : int = cpu_regs["AX"] & 0xFF
+				if a8 >= 0x80: a8 -= 0x100
+				var b8 : int = val if val < 0x80 else val - 0x100
+				var r4 : int = a8 * b8
+				cpu_regs["AX"] = r4 & 0xFFFF
+		6:   # DIV
+			if val == 0:
+				cpu_handle_interrupt(0x00)   # PC9: деление на ноль -> настоящее INT 00h
+				return
+			if word:
+				var num : int = (cpu_regs["DX"] << 16) | cpu_regs["AX"]
+				var q   : int = int(num / val)
+				var rmv : int = num % val
+				if q > 0xFFFF:
+					cpu_handle_interrupt(0x00)
+					return
+				cpu_regs["AX"] = q & 0xFFFF
+				cpu_regs["DX"] = rmv & 0xFFFF
+			else:
+				var numb : int = cpu_regs["AX"]
+				var qb   : int = int(numb / val)
+				var rmb  : int = numb % val
+				if qb > 0xFF:
+					cpu_handle_interrupt(0x00)
+					return
+				cpu_set_r8(0, qb)
+				cpu_set_r8(4, rmb)
+		7:   # IDIV
+			if val == 0:
+				cpu_handle_interrupt(0x00)
+				return
+			if word:
+				var numw : int = (cpu_regs["DX"] << 16) | cpu_regs["AX"]
+				if numw >= 0x80000000: numw -= 0x100000000
+				var sv  : int = val if val < 0x8000 else val - 0x10000
+				if sv == 0:
+					cpu_handle_interrupt(0x00)
+					return
+				var qw  : int = int(numw / sv)
+				var rmw : int = numw - qw * sv
+				cpu_regs["AX"] = qw & 0xFFFF
+				cpu_regs["DX"] = rmw & 0xFFFF
+
+# ── Группа 4 ──────────────────────────────────────────────────
+func _op_group4() -> void:
+	var m   : Dictionary = cpu_decode_modrm(false)
+	var val : int = cpu_get_rm(m)
+	var ext : int = m["reg"]
+	var old_cf : int = cpu_flags["CF"]
+	var r : int = (val + 1) & 0xFF if ext == 0 else (val - 1) & 0xFF
+	cpu_upd_flags(r, 8, ext == 1, val, 1)
+	cpu_flags["CF"] = old_cf
+	cpu_set_rm(m, r)
+
+# ── Группа 5 ──────────────────────────────────────────────────
+func _op_group5() -> void:
+	var m   : Dictionary = cpu_decode_modrm(true)
+	var val : int = cpu_get_rm(m)
+	var ext : int = m["reg"]
+	var old_cf : int = cpu_flags["CF"]
+	match ext:
+		0:   # INC
+			var r : int = (val + 1) & 0xFFFF
+			cpu_upd_flags(r, 16, false, val, 1)
+			cpu_flags["CF"] = old_cf
+			cpu_set_rm(m, r)
+		1:   # DEC
+			var r2 : int = (val - 1) & 0xFFFF
+			cpu_upd_flags(r2, 16, true, val, 1)
+			cpu_flags["CF"] = old_cf
+			cpu_set_rm(m, r2)
+		2:   # CALL near indirect
+			cpu_push(cpu_ip)
+			cpu_ip = val
+		4:   # JMP near indirect
+			cpu_ip = val
+		6:   # PUSH r/m
+			cpu_push(val)
+
+# ── REP ───────────────────────────────────────────────────────
+func _op_rep(op: int) -> void:
+	var repne : bool = (op == 0xF2)
+	var sc    : int  = cpu_fetch_b()
+	while cpu_regs["CX"] > 0:
+		match sc:
+			0xA4: cpu_movsb()
+			0xA5: cpu_movsw()
+			0xAA: cpu_stosb()
+			0xAB: cpu_stosw()
+			0xAC: cpu_lodsb()
+			0xAD: cpu_lodsw()
+			0xAE: cpu_scasb()
+			_:
+				print("[REP] Неизвестная команда 0x%02X" % sc)
+				cpu_halt = true
+				break
+		cpu_regs["CX"] = (cpu_regs["CX"] - 1) & 0xFFFF
+		if sc == 0xAE:
+			if repne and cpu_flags["ZF"] == 1: break
+			if not repne and cpu_flags["ZF"] == 0: break
+
+# ── Сегментный префикс ────────────────────────────────────────
+func _op_seg_prefix(override_val: int) -> void:
+	cpu_seg_override = override_val
+	var next_op : int = cpu_fetch_b()
+	cpu_exec(next_op)
+	cpu_seg_override = -1
+
+# ── Условные переходы ─────────────────────────────────────────
+func _op_jcc(op: int) -> void:
+	var off_v : int = cpu_fetch_sb()
+	var f     : Dictionary = cpu_flags
+	var cond  : bool = false
+	match op:
+		0x70: cond = f["OF"] == 1
+		0x71: cond = f["OF"] == 0
+		0x72: cond = f["CF"] == 1
+		0x73: cond = f["CF"] == 0
+		0x74: cond = f["ZF"] == 1
+		0x75: cond = f["ZF"] == 0
+		0x76: cond = f["CF"] == 1 or f["ZF"] == 1
+		0x77: cond = f["CF"] == 0 and f["ZF"] == 0
+		0x78: cond = f["SF"] == 1
+		0x79: cond = f["SF"] == 0
+		0x7A: cond = f["PF"] == 1
+		0x7B: cond = f["PF"] == 0
+		0x7C: cond = f["SF"] != f["OF"]
+		0x7D: cond = f["SF"] == f["OF"]
+		0x7E: cond = f["ZF"] == 1 or f["SF"] != f["OF"]
+		0x7F: cond = f["ZF"] == 0 and f["SF"] == f["OF"]
+	if cond:
+		cpu_ip = (cpu_ip + off_v) & 0xFFFF
+
+# ── LOOP ──────────────────────────────────────────────────────
+func _op_loop(op: int) -> void:
+	var off_v : int = cpu_fetch_sb()
+	cpu_regs["CX"] = (cpu_regs["CX"] - 1) & 0xFFFF
+	var do_jump : bool = cpu_regs["CX"] != 0
+	if op == 0xE1: do_jump = do_jump and cpu_flags["ZF"] == 1
+	if op == 0xE0: do_jump = do_jump and cpu_flags["ZF"] == 0
+	if do_jump:
+		cpu_ip = (cpu_ip + off_v) & 0xFFFF
+
+# ── AAM / AAD / CBW / CWD / XLAT / PUSHF / POPF / SAHF / LAHF ─
+func _op_aam() -> void:
+	var base : int = cpu_fetch_b()
+	if base == 0:
+		cpu_handle_interrupt(0x00)
+		return
+	var al : int = cpu_regs["AX"] & 0xFF
+	cpu_regs["AX"] = ((al / base) << 8) | (al % base)
+	cpu_upd_flags(cpu_regs["AX"] & 0xFF, 8)
+
+func _op_aad() -> void:
+	var base : int = cpu_fetch_b()
+	var ah   : int = (cpu_regs["AX"] >> 8) & 0xFF
+	var al   : int =  cpu_regs["AX"]       & 0xFF
+	var res  : int = (al + ah * base) & 0xFF
+	cpu_regs["AX"] = res
+	cpu_upd_flags(res, 8)
+
+func _op_cbw() -> void:
+	var al : int = cpu_regs["AX"] & 0xFF
+	cpu_regs["AX"] = al if al < 0x80 else (al | 0xFF00)
+
+func _op_cwd() -> void:
+	cpu_regs["DX"] = 0xFFFF if (cpu_regs["AX"] & 0x8000) != 0 else 0
+
+func _op_xlat() -> void:
+	var al  : int = cpu_regs["AX"] & 0xFF
+	var bx  : int = cpu_regs["BX"]
+	cpu_set_r8(0, cpu_rb("DS", (bx + al) & 0xFFFF))
+
+func _op_pushf() -> void:
+	var fw     : int = 0
+	var names  : Array[String] = ["CF","","PF","","AF","","ZF","SF","TF","IF","DF","OF"]
+	for i in range(names.size()):
+		if names[i] != "":
+			fw |= cpu_flags.get(names[i], 0) << i
+	cpu_push(fw)
+
+func _op_popf() -> void:
+	var fw    : int = cpu_pop()
+	var names : Array[String] = ["CF","","PF","","AF","","ZF","SF","TF","IF","DF","OF"]
+	for i in range(names.size()):
+		if names[i] != "":
+			cpu_flags[names[i]] = (fw >> i) & 1
+
+func _op_sahf() -> void:
+	var ah : int = (cpu_regs["AX"] >> 8) & 0xFF
+	cpu_flags["CF"] = (ah >> 0) & 1
+	cpu_flags["PF"] = (ah >> 2) & 1
+	cpu_flags["AF"] = (ah >> 4) & 1
+	cpu_flags["ZF"] = (ah >> 6) & 1
+	cpu_flags["SF"] = (ah >> 7) & 1
+
+func _op_lahf() -> void:
+	var ah : int = (cpu_flags["CF"]
+		| (cpu_flags["PF"] << 2)
+		| (cpu_flags["AF"] << 4)
+		| (cpu_flags["ZF"] << 6)
+		| (cpu_flags["SF"] << 7)) | 0x02
+	cpu_regs["AX"] = (cpu_regs["AX"] & 0x00FF) | (ah << 8)
+
+# ── PC9: AAA / DAS — BCD-коррекция (добавлено по списку задач) ─
+func _op_aaa() -> void:
+	var al : int = cpu_regs["AX"] & 0xFF
+	var ah : int = (cpu_regs["AX"] >> 8) & 0xFF
+	if (al & 0x0F) > 9 or cpu_flags["AF"] == 1:
+		al = (al + 6) & 0xFF
+		ah = (ah + 1) & 0xFF
+		cpu_flags["AF"] = 1
+		cpu_flags["CF"] = 1
+	else:
+		cpu_flags["AF"] = 0
+		cpu_flags["CF"] = 0
+	al = al & 0x0F
+	cpu_regs["AX"] = (ah << 8) | al
+
+func _op_das() -> void:
+	var al     : int = cpu_regs["AX"] & 0xFF
+	var old_cf : int = cpu_flags["CF"]
+	var old_al : int = al
+	cpu_flags["CF"] = 0
+	if (al & 0x0F) > 9 or cpu_flags["AF"] == 1:
+		al = (al - 6) & 0xFF
+		cpu_flags["AF"] = 1
+	else:
+		cpu_flags["AF"] = 0
+	if old_al > 0x99 or old_cf == 1:
+		al = (al - 0x60) & 0xFF
+		cpu_flags["CF"] = 1
+	cpu_regs["AX"] = (cpu_regs["AX"] & 0xFF00) | al
+	cpu_upd_flags(al, 8)
+
+# ── PC9: BOUND — проверка границ массива (добавлено по списку) ─
+func _op_bound() -> void:
+	var m : Dictionary = cpu_decode_modrm(true)
+	if not m["mem"]:
+		# BOUND с операндом-регистром недопустим — просто игнорируем
+		return
+	var index_value : int = cpu_regs[REG16[m["reg"]]]
+	if index_value & 0x8000: index_value -= 0x10000
+	var low_bound  : int = cpu_rw(m["seg"], m["off"])
+	var high_bound : int = cpu_rw(m["seg"], (m["off"] + 2) & 0xFFFF)
+	if low_bound & 0x8000: low_bound -= 0x10000
+	if high_bound & 0x8000: high_bound -= 0x10000
+	if index_value < low_bound or index_value > high_bound:
+		_ps_print("[CPU EXCEPTION] BOUND: индекс %d вне диапазона [%d, %d]\n" % [index_value, low_bound, high_bound])
+		cpu_handle_interrupt(0x05)
+
+# ── Порты (CGA статус-регистр + AdLib OPL2, добавлено в PC9) ──
+func _in_port(port: int) -> int:
+	if port == 0x60:
+		if cpu_keyboard_buf.size() > 0:
+			return cpu_keyboard_buf[0][1]
+		return 0
+	if port == 0x3DA:
+		var t : int = int(Time.get_ticks_msec() / 10) % 2
+		return 0x08 if t == 0 else 0x00
+	if port == 0x388:
+		return 0x00   # Статус AdLib: 00 = готов принимать команды
+	return 0xFF
+
+func _out_port(port: int, val: int) -> void:
+	if port in [0x42, 0x43, 0x61]:
+		pass   # PC-speaker (зарезервировано)
+	elif port == 0x388:
+		adlib_index = val & 0xFF
+	elif port == 0x389:
+		adlib_write_register(adlib_index, val & 0xFF)
+	elif port == 0x20:
+		pass   # EOI контроллера прерываний (зарезервировано)
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 3 — ПРЕРЫВАНИЯ
+# ══════════════════════════════════════════════════════════════
+func cpu_handle_interrupt(num: int) -> void:
+	match num:
+		0x00:
+			_ps_print("[CPU EXCEPTION] Деление на ноль в %04X:%04X!\n" % [cpu_segs["CS"], cpu_ip])
+			cpu_halt = true
+		0x05:
+			_ps_print("[CPU EXCEPTION] INT 05h: BOUND — выход индекса за границы массива.\n")
+		0x06:
+			_ps_print("[CPU EXCEPTION] INT 06h: недопустимый опкод.\n")
+			cpu_halt = true
+		0x08:   # IRQ0 — системный таймер (вызывается из _tick_timer)
+			_tick_timer_raw()
+		0x10: _int_10h()
+		0x11: _int_11h()
+		0x12: _int_12h()
+		0x15: _int_15h()
+		0x16: _int_16h()
+		0x1A: _int_1ah()
+		0x20: cpu_halt = true
+		0x21: _int_21h()
+		_:
+			_ps_print("[BIOS WARNING] Нереализованное прерывание: INT 0x%02X\n" % num)
+
+# ── INT 21h — DOS API ─────────────────────────────────────────
+func _int_21h() -> void:
+	var ah : int = (cpu_regs["AX"] >> 8) & 0xFF
+	var al : int =  cpu_regs["AX"]       & 0xFF
+
+	match ah:
+		0x00: cpu_halt = true
+		0x02:
+			var ch : String = char(cpu_regs["DX"] & 0xFF)
+			_ps_print(ch)
+		0x09:
+			var addr : int = cpu_get_phys("DS", cpu_regs["DX"])
+			var s    : String = ""
+			while memory[addr] != 0x24 and addr < RAM_SIZE - 1:
+				s += char(memory[addr])
+				addr += 1
+			_ps_print(s)
+		0x2A:
+			var dt : Dictionary = Time.get_datetime_dict_from_system()
+			cpu_regs["CX"] = dt["year"]
+			cpu_regs["DX"] = (dt["month"] << 8) | dt["day"]
+		0x2C:
+			var dt2 : Dictionary = Time.get_datetime_dict_from_system()
+			cpu_regs["CX"] = (dt2["hour"] << 8) | dt2["minute"]
+			cpu_regs["DX"] = (dt2["second"] << 8) | 0
+		0x30:
+			cpu_regs["AX"] = 0x0003  # DOS 3.0
+		0x35:
+			cpu_regs["BX"] = 0
+			cpu_segs["ES"] = 0
+		0x3D:
+			var addr2 : int = cpu_get_phys("DS", cpu_regs["DX"])
+			var name_str : String = ""
+			while memory[addr2] != 0 and addr2 < RAM_SIZE - 1:
+				name_str += char(memory[addr2])
+				addr2 += 1
+			var f : FileAccess = FileAccess.open(name_str, FileAccess.READ)
+			if f:
+				var fd : int = (cpu_file_handles.keys().max() if cpu_file_handles.size() > 0 else 4) + 1
+				cpu_file_handles[fd] = f
+				cpu_regs["AX"] = fd
+				cpu_flags["CF"] = 0
+			else:
+				cpu_regs["AX"] = 0x02
+				cpu_flags["CF"] = 1
+		0x3E:
+			var fd2 : int = cpu_regs["BX"]
+			if cpu_file_handles.has(fd2):
+				cpu_file_handles[fd2].close()
+				cpu_file_handles.erase(fd2)
+			cpu_flags["CF"] = 0
+		0x3F:
+			var fd3   : int = cpu_regs["BX"]
+			var cnt   : int = cpu_regs["CX"]
+			var addr3 : int = cpu_get_phys("DS", cpu_regs["DX"])
+			if cpu_file_handles.has(fd3):
+				var data : PackedByteArray = cpu_file_handles[fd3].get_buffer(cnt)
+				for i in range(data.size()):
+					if addr3 + i < RAM_SIZE:
+						memory[addr3 + i] = data[i]
+				cpu_regs["AX"] = data.size()
+				cpu_flags["CF"] = 0
+			else:
+				cpu_regs["AX"] = 0x06
+				cpu_flags["CF"] = 1
+		0x40:
+			var fd4   : int = cpu_regs["BX"]
+			var cnt2  : int = cpu_regs["CX"]
+			var addr4 : int = cpu_get_phys("DS", cpu_regs["DX"])
+			if fd4 in [1, 2]:
+				var s2 : String = ""
+				for i in range(cnt2):
+					if addr4 + i < RAM_SIZE:
+						s2 += char(memory[addr4 + i])
+				_ps_print(s2)
+				cpu_regs["AX"] = cnt2
+				cpu_flags["CF"] = 0
+		0x42: cpu_flags["CF"] = 0
+		0x48:
+			cpu_regs["AX"] = 0x2000
+			cpu_flags["CF"] = 0
+		0x49: cpu_flags["CF"] = 0
+		0x4A: cpu_flags["CF"] = 0
+		0x4C:
+			_ps_print("\n[DOS] Программа завершена. Код: %d\n" % al)
+			cpu_halt = true
+		_: pass
+
+# ── INT 10h — Видео BIOS ──────────────────────────────────────
+func _int_10h() -> void:
+	var ah : int = (cpu_regs["AX"] >> 8) & 0xFF
+	var al : int =  cpu_regs["AX"]       & 0xFF
+	match ah:
+		0x0E: _ps_print(char(al))
+		_: pass
+
+# ── INT 11h — Опрос конфигурации оборудования (новое в PC9) ──
+func _int_11h() -> void:
+	# Биты результата: 0=1 (есть дисковод), 4-5=10 (видеорежим CGA 80x25),
+	# 6-7=00 (количество дисководов минус 1)
+	cpu_regs["AX"] = 0x0021
+
+# ── INT 12h — Размер базовой памяти (новое в PC9) ─────────────
+func _int_12h() -> void:
+	cpu_regs["AX"] = 640   # Сообщаем программе, что доступно 640 КБ ОЗУ
+
+# ── INT 15h — Системные сервисы: задержки/джойстик (новое) ───
+func _int_15h() -> void:
+	var ah : int = (cpu_regs["AX"] >> 8) & 0xFF
+	match ah:
+		0x86:   # Задержка в микросекундах (CX:DX)
+			var cx : int = cpu_regs["CX"]
+			var dx : int = cpu_regs["DX"]
+			var microseconds : int = (cx << 16) | dx
+			OS.delay_usec(mini(microseconds, 200000))   # ограничение, чтобы не подвесить эмулятор
+			cpu_flags["CF"] = 0
+		0x84:   # Поддержка джойстика
+			var sub_fn : int = cpu_regs["DX"]
+			if sub_fn == 0:
+				cpu_regs["AX"] = (cpu_regs["AX"] & 0xFF00) | 0xF0   # кнопки не нажаты
+				cpu_flags["CF"] = 0
+			else:
+				cpu_regs["AX"] = 0
+				cpu_regs["BX"] = 0
+				cpu_regs["CX"] = 0
+				cpu_regs["DX"] = 0
+				cpu_flags["CF"] = 1   # джойстик не подключён
+		0x88:   # Память выше 1 МБ
+			cpu_regs["AX"] = 0
+			cpu_flags["CF"] = 0
+		_:
+			cpu_flags["CF"] = 0
+
+# ── INT 16h — Клавиатура BIOS ────────────────────────────────
+func _int_16h() -> void:
+	var ah : int = (cpu_regs["AX"] >> 8) & 0xFF
+	match ah:
+		0x00:
+			if cpu_keyboard_buf.size() > 0:
+				var pair : Array = cpu_keyboard_buf.pop_front()
+				cpu_regs["AX"] = (pair[1] << 8) | pair[0]
+			else:
+				cpu_ip = (cpu_ip - 2) & 0xFFFF  # Ждать
+		0x01:
+			if cpu_keyboard_buf.size() > 0:
+				var pair2 : Array = cpu_keyboard_buf[0]
+				cpu_regs["AX"] = (pair2[1] << 8) | pair2[0]
+				cpu_flags["ZF"] = 0
+			else:
+				cpu_flags["ZF"] = 1
+
+# ── INT 1Ah — Системные часы (новое в PC9) ────────────────────
+func _int_1ah() -> void:
+	var ah : int = (cpu_regs["AX"] >> 8) & 0xFF
+	match ah:
+		0x00:   # Чтение тиков таймера — используется играми для srand()
+			var t : int = (memory[TIMER_ADDR]
+				| (memory[TIMER_ADDR+1] << 8)
+				| (memory[TIMER_ADDR+2] << 16)
+				| (memory[TIMER_ADDR+3] << 24))
+			cpu_regs["CX"] = (t >> 16) & 0xFFFF
+			cpu_regs["DX"] = t & 0xFFFF
+			cpu_regs["AX"] = (cpu_regs["AX"] & 0xFF00)   # AL=0, полночь не наступала
+		0x01:   # Установка тиков таймера
+			var t2 : int = (cpu_regs["CX"] << 16) | cpu_regs["DX"]
+			memory[TIMER_ADDR]   = t2 & 0xFF
+			memory[TIMER_ADDR+1] = (t2 >> 8) & 0xFF
+			memory[TIMER_ADDR+2] = (t2 >> 16) & 0xFF
+			memory[TIMER_ADDR+3] = (t2 >> 24) & 0xFF
+		_: pass
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 4 — ЗАГРУЗЧИК .COM и .EXE
+# ══════════════════════════════════════════════════════════════
+
+func loader_create_psp(segment: int, cmd_line: String = "") -> void:
+	var base : int = segment << 4
+	for i in range(256):
+		memory[base + i] = 0
+	memory[base]     = 0xCD
+	memory[base + 1] = 0x20
+	memory[base + 2] = 0x00
+	memory[base + 3] = 0xA0
+	var cmd : PackedByteArray = cmd_line.to_ascii_buffer()
+	var cmd_len : int = mini(cmd.size(), 126)
+	memory[base + 0x80] = cmd_len
+	for i in range(cmd_len):
+		memory[base + 0x81 + i] = cmd[i]
+	memory[base + 0x81 + cmd_len] = 0x0D
+
+func loader_load_com(path: String) -> bool:
+	var f : FileAccess = FileAccess.open(path, FileAccess.READ)
+	if not f:
+		_ps_print("[LOADER] Ошибка чтения: " + path + "\n")
+		return false
+	var data : PackedByteArray = f.get_buffer(f.get_length())
+	f.close()
+
+	var seg  : int = LOAD_SEGMENT
+	loader_create_psp(seg, path.get_file())
+
+	var base : int = (seg << 4) + PSP_SIZE
+	for i in range(data.size()):
+		if base + i < RAM_SIZE:
+			memory[base + i] = data[i]
+
+	cpu_segs["CS"] = seg; cpu_segs["DS"] = seg
+	cpu_segs["ES"] = seg; cpu_segs["SS"] = seg
+	cpu_ip         = 0x0100
+	cpu_regs["SP"] = 0xFFFE
+	cpu_halt       = false
+	_ps_print("[LOADER] .COM загружен: %s (%d байт)\n" % [path, data.size()])
+	return true
+
+func loader_load_exe(path: String) -> bool:
+	var f : FileAccess = FileAccess.open(path, FileAccess.READ)
+	if not f:
+		_ps_print("[LOADER] Ошибка чтения: " + path + "\n")
+		return false
+	var raw : PackedByteArray = f.get_buffer(f.get_length())
+	f.close()
+
+	if raw.size() < 28:
+		return loader_load_com(path)
+
+	var sig : String = char(raw[0]) + char(raw[1])
+	if sig != "MZ" and sig != "ZM":
+		_ps_print("[LOADER] Не MZ — загружаем как .COM\n")
+		return loader_load_com(path)
+
+	# Разбираем заголовок MZ
+	var last_page  : int = (raw[3] << 8) | raw[2]
+	var pages      : int = (raw[5] << 8) | raw[4]
+	var reloc_cnt  : int = (raw[7] << 8) | raw[6]
+	var hdr_para   : int = (raw[9] << 8) | raw[8]
+	var ss_rel     : int = (raw[15] << 8) | raw[14]
+	var sp_init    : int = (raw[17] << 8) | raw[16]
+	var ip_init    : int = (raw[21] << 8) | raw[20]
+	var cs_rel     : int = (raw[23] << 8) | raw[22]
+	var reloc_off  : int = (raw[25] << 8) | raw[24]
+
+	var hdr_size   : int = hdr_para * 16
+	var seg_start  : int = LOAD_SEGMENT
+	var phys_start : int = seg_start << 4
+
+	var code : PackedByteArray = raw.slice(hdr_size)
+	for i in range(code.size()):
+		if phys_start + i < RAM_SIZE:
+			memory[phys_start + i] = code[i]
+
+	# Релокация
+	var ptr : int = reloc_off
+	for _ri in range(reloc_cnt):
+		var r_off : int = (raw[ptr + 1] << 8) | raw[ptr]
+		var r_seg : int = (raw[ptr + 3] << 8) | raw[ptr + 2]
+		ptr += 4
+		var fix_addr : int = ((seg_start + r_seg) << 4) + r_off
+		if fix_addr + 1 < RAM_SIZE:
+			var old_val : int = memory[fix_addr] | (memory[fix_addr + 1] << 8)
+			var new_val : int = (old_val + seg_start) & 0xFFFF
+			memory[fix_addr]     = new_val & 0xFF
+			memory[fix_addr + 1] = (new_val >> 8) & 0xFF
+
+	cpu_segs["CS"] = (seg_start + cs_rel) & 0xFFFF
+	cpu_ip         = ip_init
+	cpu_segs["SS"] = (seg_start + ss_rel) & 0xFFFF
+	cpu_regs["SP"] = sp_init
+	cpu_segs["DS"] = seg_start
+	cpu_segs["ES"] = seg_start
+	cpu_halt       = false
+	_ps_print("[LOADER] .EXE загружен: %s (%d байт кода)\n" % [path, code.size()])
+	return true
+
+func loader_open_file_dialog() -> void:
+	# Открываем нативный проводник Windows через PowerShell + OpenFileDialog
+	var tmp_path : String = OS.get_temp_dir().path_join("pc9_selected.txt")
+
+	var tmp_esc  : String = tmp_path.replace("\\", "\\\\")
+	var ps_script : String = (
+		"Add-Type -AssemblyName System.Windows.Forms;"
+		+ "$dlg = New-Object System.Windows.Forms.OpenFileDialog;"
+		+ "$dlg.Title = 'PC9: Выберите программу (.COM или .EXE)';"
+		+ "$dlg.Filter = 'DOS программы (*.com;*.exe)|*.com;*.exe|Все файлы (*.*)|*.*';"
+		+ "$dlg.FilterIndex = 1;"
+		+ "if ($dlg.ShowDialog() -eq 'OK') { $dlg.FileName | Out-File -Encoding UTF8 -NoNewline -FilePath '"
+		+ tmp_esc + "' }"
+		+ " else { Set-Content -Path '" + tmp_esc + "' -Value ''}"
+	)
+
+	if FileAccess.file_exists(tmp_path):
+		DirAccess.remove_absolute(tmp_path)
+
+	var exit_code : int = OS.execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps_script])
+
+	if exit_code != 0:
+		_ps_print("[PC9] Ошибка запуска проводника Windows (код %d).\n" % exit_code)
+		return
+
+	if not FileAccess.file_exists(tmp_path):
+		_ps_print("[PC9] Файл не выбран.\n")
+		return
+
+	var f_tmp : FileAccess = FileAccess.open(tmp_path, FileAccess.READ)
+	var path  : String     = f_tmp.get_as_text().strip_edges()
+	f_tmp.close()
+	DirAccess.remove_absolute(tmp_path)
+
+	if path.is_empty():
+		_ps_print("[PC9] Файл не выбран.\n")
+		return
+
+	_on_file_selected(path)
+
+func _on_file_selected(path: String) -> void:
+	var ext : String = path.get_extension().to_lower()
+	var ok  : bool
+	if ext == "com":
+		ok = loader_load_com(path)
+	else:
+		ok = loader_load_exe(path)
+	if ok:
+		_ps_print("[PC9] Файл загружен. Запуск...\n")
+		_start_emulation()
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 5 — CGA ДИСПЛЕЙ
+# ══════════════════════════════════════════════════════════════
+var cga_image   : Image
+var cga_texture : ImageTexture
+var cga_rect    : TextureRect
+
+func cga_init(parent: Control) -> void:
+	cga_image   = Image.create(CGA_W, CGA_H, false, Image.FORMAT_RGBA8)
+	cga_image.fill(Color(0, 0, 0))
+	cga_texture = ImageTexture.create_from_image(cga_image)
+
+	cga_rect = TextureRect.new()
+	cga_rect.texture             = cga_texture
+	cga_rect.expand_mode         = TextureRect.EXPAND_FIT_WIDTH_PROPORTIONAL
+	cga_rect.stretch_mode        = TextureRect.STRETCH_SCALE
+	cga_rect.custom_minimum_size = Vector2(CGA_W * 2, CGA_H * 2)
+	cga_rect.size                = Vector2(CGA_W * 2, CGA_H * 2)
+	parent.add_child(cga_rect)
+
+func cga_render() -> void:
+	if not cga_image: return
+	for y in range(CGA_H):
+		var row_base : int
+		if y % 2 == 0:
+			row_base = CGA_VRAM + (y / 2) * 80
+		else:
+			row_base = CGA_VRAM + 0x2000 + (y / 2) * 80
+
+		for b in range(80):
+			var addr : int = row_base + b
+			var byte_val : int = memory[addr] if addr < RAM_SIZE else 0
+			var x_base : int = b * 4
+			cga_image.set_pixel(x_base + 0, y, CGA_PALETTE[(byte_val >> 6) & 3])
+			cga_image.set_pixel(x_base + 1, y, CGA_PALETTE[(byte_val >> 4) & 3])
+			cga_image.set_pixel(x_base + 2, y, CGA_PALETTE[(byte_val >> 2) & 3])
+			cga_image.set_pixel(x_base + 3, y, CGA_PALETTE[byte_val & 3])
+
+	cga_texture.update(cga_image)
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 5B — ЗВУКОВАЯ КАРТА AdLib / OPL2 (новое в PC9)
+# ══════════════════════════════════════════════════════════════
+class OPL2Channel:
+	var fnum       : int = 0
+	var block      : int = 0
+	var key_on     : bool = false
+	var mult_mod   : float = 1.0   # Множитель частоты модулятора
+	var mult_car   : float = 1.0   # Множитель частоты носителя
+	var vol_mod    : float = 0.0   # Громкость модулятора (глубина FM)
+	var vol_car    : float = 0.0   # Выходная громкость носителя
+	var phase_mod  : float = 0.0   # Текущая фаза модулятора
+	var phase_car  : float = 0.0   # Текущая фаза носителя
+
+var adlib_player   : AudioStreamPlayer
+var adlib_playback : AudioStreamGeneratorPlayback
+var adlib_index    : int = 0
+var adlib_regs     : PackedByteArray
+var opl_channels   : Array = []
+
+const SAMPLE_RATE  : float = 22050.0
+
+# Карта соответствия смещений операторов OPL2 к 9 каналам эмулятора
+const OP_TO_CHANNEL : Dictionary = {
+	0x00: 0, 0x01: 1, 0x02: 2, 0x03: 0, 0x04: 1, 0x05: 2,
+	0x08: 3, 0x09: 4, 0x0A: 5, 0x0B: 3, 0x0C: 4, 0x0D: 5,
+	0x10: 6, 0x11: 7, 0x12: 8, 0x13: 6, 0x14: 7, 0x15: 8
+}
+
+# Определяем, является ли оператор модулятором (true) или носителем (false)
+const OP_IS_MODULATOR : Dictionary = {
+	0x00: true,  0x01: true,  0x02: true,  0x03: false, 0x04: false, 0x05: false,
+	0x08: true,  0x09: true,  0x0A: true,  0x0B: false, 0x0C: false, 0x0D: false,
+	0x10: true,  0x11: true,  0x12: true,  0x13: false, 0x14: false, 0x15: false
+}
+
+func adlib_init() -> void:
+	adlib_regs.resize(256)
+	adlib_regs.fill(0)
+
+	opl_channels.clear()
+	for i in range(9):
+		opl_channels.append(OPL2Channel.new())
+
+	adlib_player = AudioStreamPlayer.new()
+	var generator : AudioStreamGenerator = AudioStreamGenerator.new()
+	generator.mix_rate = SAMPLE_RATE
+	generator.buffer_length = 0.08   # Буфер 80мс для предотвращения задержек/заиканий
+	adlib_player.stream = generator
+	add_child(adlib_player)
+	adlib_player.play()
+	adlib_playback = adlib_player.get_stream_playback()
+	print("[SND] Звуковая карта AdLib OPL2 инициализирована.")
+
+func adlib_write_register(reg: int, val: int) -> void:
+	adlib_regs[reg] = val
+
+	# 0x20 - 0x35: Множители частоты операторов (MULT)
+	if reg >= 0x20 and reg <= 0x35:
+		var op_offset : int = reg - 0x20
+		if OP_TO_CHANNEL.has(op_offset):
+			var ch_idx : int = OP_TO_CHANNEL[op_offset]
+			var mult : float = float(val & 0x0F)
+			if mult == 0: mult = 0.5
+			if OP_IS_MODULATOR[op_offset]:
+				opl_channels[ch_idx].mult_mod = mult
+			else:
+				opl_channels[ch_idx].mult_car = mult
+
+	# 0x40 - 0x55: Уровень затухания / Громкость (Total Level)
+	elif reg >= 0x40 and reg <= 0x55:
+		var op_offset2 : int = reg - 0x40
+		if OP_TO_CHANNEL.has(op_offset2):
+			var ch_idx2 : int = OP_TO_CHANNEL[op_offset2]
+			var tl  : int = val & 0x3F   # 6 бит уровня (0 = максимальная громкость)
+			var vol : float = 1.0 - (tl / 63.0)
+			if OP_IS_MODULATOR[op_offset2]:
+				opl_channels[ch_idx2].vol_mod = vol * 8.0   # Усиливаем для глубины модуляции
+			else:
+				opl_channels[ch_idx2].vol_car = vol
+
+	# 0xA0 - 0xA8: F-Number Low (младшие 8 бит частоты ноты для каналов 0-8)
+	elif reg >= 0xA0 and reg <= 0xA8:
+		var ch_idx3 : int = reg - 0xA0
+		opl_channels[ch_idx3].fnum = (opl_channels[ch_idx3].fnum & 0x300) | val
+
+	# 0xB0 - 0xB8: Key On (старт ноты), Block (октава), старшие биты F-Number
+	elif reg >= 0xB0 and reg <= 0xB8:
+		var ch_idx4 : int = reg - 0xB0
+		opl_channels[ch_idx4].fnum  = (opl_channels[ch_idx4].fnum & 0xFF) | ((val & 3) << 8)
+		opl_channels[ch_idx4].block = (val >> 2) & 7
+
+		var new_key_on : bool = bool((val >> 5) & 1)
+		if new_key_on != opl_channels[ch_idx4].key_on:
+			opl_channels[ch_idx4].key_on = new_key_on
+			if new_key_on:
+				opl_channels[ch_idx4].phase_mod = 0.0
+				opl_channels[ch_idx4].phase_car = 0.0
+
+func adlib_update_audio() -> void:
+	if adlib_playback == null:
+		return
+
+	var frames_to_fill : int = adlib_playback.get_frames_available()
+	var dt : float = 1.0 / SAMPLE_RATE
+
+	while frames_to_fill > 0:
+		var chunk : int = mini(frames_to_fill, 128)
+		for i in range(chunk):
+			var mixed_sample : float = 0.0
+
+			for ch_idx in range(9):
+				var ch : OPL2Channel = opl_channels[ch_idx]
+				if not ch.key_on or ch.fnum == 0:
+					continue
+
+				# Формула частоты OPL2: F = (FNum * 49716) / 2^(20 - Block)
+				var base_freq : float = float(ch.fnum) * 49716.0 / float(1 << (20 - ch.block))
+				if base_freq <= 0: continue
+
+				# Оператор 1 (модулятор частоты)
+				ch.phase_mod += 2.0 * PI * (base_freq * ch.mult_mod) * dt
+				if ch.phase_mod > 2.0 * PI: ch.phase_mod -= 2.0 * PI
+				var mod_out : float = sin(ch.phase_mod) * ch.vol_mod
+
+				# Оператор 2 (носитель звука с частотной модуляцией)
+				ch.phase_car += 2.0 * PI * (base_freq * ch.mult_car) * dt
+				if ch.phase_car > 2.0 * PI: ch.phase_car -= 2.0 * PI
+
+				var car_out : float = sin(ch.phase_car + mod_out) * ch.vol_car
+				mixed_sample += car_out * 0.15
+
+			mixed_sample = clamp(mixed_sample, -1.0, 1.0)
+			adlib_playback.push_frame(Vector2(mixed_sample, mixed_sample))
+
+		frames_to_fill -= chunk
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 6 — UI: РАБОЧИЙ СТОЛ
+# ══════════════════════════════════════════════════════════════
+
+var ui_desktop      : Panel
+var ui_taskbar      : Panel
+var ui_clock_label  : Label
+var ui_welcome      : Label
+var ui_start_btn    : Button
+var ui_lang_btn     : Button
+var ui_start_menu   : Panel
+var ui_start_visible: bool = false
+
+# PowerShell окно
+var ps_window       : Window
+var ps_text         : RichTextLabel
+var ps_input        : LineEdit
+var ps_waiting_yn   : bool = false
+
+# CGA окно
+var cga_window      : Window
+
+# Буфер вывода PowerShell
+var ps_output_buf   : String = ""
+
+func _ready() -> void:
+	mem_init()
+	adlib_init()       # PC9: звуковая карта запускается при старте системы
+	_build_desktop()
+	set_process(true)
+	# Системный таймер 18.2 Гц
+	var timer : Timer = Timer.new()
+	timer.wait_time = 1.0 / 18.2
+	timer.autostart = true
+	timer.timeout.connect(_tick_timer)
+	add_child(timer)
+	# Часы
+	var clock_timer : Timer = Timer.new()
+	clock_timer.wait_time = 1.0
+	clock_timer.autostart = true
+	clock_timer.timeout.connect(_tick_clock)
+	add_child(clock_timer)
+	print("=".repeat(60))
+	print("  PC9 — Radchenko Windows 82  v2.0")
+	print("  Автор: Никита Радченко")
+	print("  GDScript-порт для Godot 4")
+	print("=".repeat(60))
+
+func _build_desktop() -> void:
+	set_anchors_preset(Control.PRESET_FULL_RECT)
+
+	ui_desktop = Panel.new()
+	ui_desktop.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var ds_style : StyleBoxFlat = StyleBoxFlat.new()
+	ds_style.bg_color = Color(0.12, 0.15, 0.17)
+	ui_desktop.add_theme_stylebox_override("panel", ds_style)
+	add_child(ui_desktop)
+
+	ui_welcome = Label.new()
+	ui_welcome.text              = L("welcome")
+	ui_welcome.add_theme_color_override("font_color", Color(1, 1, 1))
+	ui_welcome.add_theme_font_size_override("font_size", 26)
+	ui_welcome.set_anchors_preset(Control.PRESET_CENTER)
+	ui_welcome.position         = Vector2(-200, -20)
+	ui_desktop.add_child(ui_welcome)
+
+	_make_desktop_icon("PowerShell", Vector2(40,  60),  _open_powershell)
+	_make_desktop_icon("Игра",       Vector2(40,  160), _run_game)
+	_make_desktop_icon("Дисплей",    Vector2(40,  260), _open_cga_window)
+	_make_desktop_icon("О системе",  Vector2(40,  360), _show_about)
+
+	ui_taskbar = Panel.new()
+	ui_taskbar.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
+	ui_taskbar.custom_minimum_size = Vector2(0, 48)
+	ui_taskbar.offset_top = -48
+	var tb_style : StyleBoxFlat = StyleBoxFlat.new()
+	tb_style.bg_color = Color(0.067, 0.086, 0.102)
+	ui_taskbar.add_theme_stylebox_override("panel", tb_style)
+	add_child(ui_taskbar)
+
+	ui_start_btn = Button.new()
+	ui_start_btn.text     = L("start")
+	ui_start_btn.position = Vector2(8, 6)
+	ui_start_btn.size     = Vector2(90, 36)
+	_style_button(ui_start_btn, Color(0.0, 0.47, 0.843))
+	ui_taskbar.add_child(ui_start_btn)
+	ui_start_btn.pressed.connect(_toggle_start_menu)
+
+	ui_lang_btn = Button.new()
+	ui_lang_btn.text     = L("lang_btn")
+	ui_lang_btn.position = Vector2(110, 6)
+	ui_lang_btn.size     = Vector2(90, 36)
+	_style_button(ui_lang_btn, Color(0.17, 0.22, 0.26))
+	ui_taskbar.add_child(ui_lang_btn)
+	ui_lang_btn.pressed.connect(_toggle_lang)
+
+	ui_clock_label = Label.new()
+	ui_clock_label.text     = Time.get_time_string_from_system()
+	ui_clock_label.position = Vector2(220, 12)
+	ui_clock_label.add_theme_color_override("font_color", Color(0.67, 0.67, 0.67))
+	ui_taskbar.add_child(ui_clock_label)
+
+	ui_start_menu = Panel.new()
+	ui_start_menu.visible      = false
+	ui_start_menu.custom_minimum_size = Vector2(240, 180)
+	var sm_style : StyleBoxFlat = StyleBoxFlat.new()
+	sm_style.bg_color      = Color(0.10, 0.133, 0.16)
+	sm_style.border_color  = Color(0.3, 0.3, 0.3)
+	sm_style.border_width_left   = 1
+	sm_style.border_width_right  = 1
+	sm_style.border_width_top    = 1
+	sm_style.border_width_bottom = 1
+	ui_start_menu.add_theme_stylebox_override("panel", sm_style)
+	add_child(ui_start_menu)
+	_build_start_menu()
+
+func _make_desktop_icon(text: String, pos: Vector2, callback: Callable) -> void:
+	var frm : VBoxContainer = VBoxContainer.new()
+	frm.position = pos
+	frm.custom_minimum_size = Vector2(70, 80)
+
+	var icon_lbl : Label = Label.new()
+	icon_lbl.text = "■"
+	icon_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	icon_lbl.add_theme_color_override("font_color", Color(0.33, 0.60, 1.0))
+	icon_lbl.add_theme_font_size_override("font_size", 32)
+	frm.add_child(icon_lbl)
+
+	var name_lbl : Label = Label.new()
+	name_lbl.text = text
+	name_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	name_lbl.add_theme_color_override("font_color", Color(1, 1, 1))
+	name_lbl.add_theme_font_size_override("font_size", 11)
+	frm.add_child(name_lbl)
+
+	var btn : Button = Button.new()
+	btn.flat            = true
+	btn.size            = Vector2(70, 80)
+	btn.position        = Vector2(0, 0)
+	btn.modulate        = Color(1, 1, 1, 0)   # Прозрачная — поверх иконки
+	frm.add_child(btn)
+	btn.pressed.connect(callback)
+	ui_desktop.add_child(frm)
+
+func _build_start_menu() -> void:
+	var vbox : VBoxContainer = VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.add_theme_constant_override("separation", 4)
+	ui_start_menu.add_child(vbox)
+
+	var items : Array = [
+		["PowerShell",      Color(0.004, 0.141, 0.337), _open_powershell],
+		["Запустить игру",  Color(0.10,  0.29,  0.10),  _run_game],
+		["CGA Дисплей",     Color(0.16,  0.16,  0.35),  _open_cga_window],
+		["О системе",       Color(0.16,  0.21,  0.25),  _show_about],
+		["Завершить работу",Color(0.77,  0.17,  0.11),  _shutdown],
+	]
+	for item in items:
+		var btn : Button = Button.new()
+		btn.text         = item[0]
+		btn.alignment    = HORIZONTAL_ALIGNMENT_LEFT
+		_style_button(btn, item[1])
+		vbox.add_child(btn)
+		btn.pressed.connect(item[2])
+
+func _style_button(btn: Button, bg: Color) -> void:
+	var style : StyleBoxFlat = StyleBoxFlat.new()
+	style.bg_color         = bg
+	style.corner_radius_top_left     = 4
+	style.corner_radius_top_right    = 4
+	style.corner_radius_bottom_left  = 4
+	style.corner_radius_bottom_right = 4
+	btn.add_theme_stylebox_override("normal", style)
+	btn.add_theme_color_override("font_color", Color(1, 1, 1))
+
+func _toggle_start_menu() -> void:
+	ui_start_visible = not ui_start_visible
+	ui_start_menu.visible = ui_start_visible
+	if ui_start_visible:
+		var viewport_h : float = get_viewport_rect().size.y
+		ui_start_menu.position = Vector2(8, viewport_h - 48 - 190)
+
+func _toggle_lang() -> void:
+	lang = "EN" if lang == "RU" else "RU"
+	ui_welcome.text  = L("welcome")
+	ui_start_btn.text = L("start")
+	ui_lang_btn.text  = L("lang_btn")
+
+func _shutdown() -> void:
+	emu_running = false
+	get_tree().quit()
+
+func _show_about() -> void:
+	if ui_start_visible: _toggle_start_menu()
+	var dlg : AcceptDialog = AcceptDialog.new()
+	dlg.title       = "О системе PC9"
+	dlg.dialog_text = L("about")
+	add_child(dlg)
+	dlg.popup_centered()
+
+func _tick_clock() -> void:
+	if ui_clock_label:
+		ui_clock_label.text = Time.get_time_string_from_system()
+
+# ── Системный таймер: обновление BIOS-счётчика тиков ─────────
+func _tick_timer() -> void:
+	cpu_handle_interrupt(0x08)   # PC9: тик идёт через настоящий IRQ0 (INT 08h)
+
+func _tick_timer_raw() -> void:
+	var addr : int = TIMER_ADDR
+	if addr + 3 < RAM_SIZE:
+		var val : int = (memory[addr] | (memory[addr+1] << 8)
+			| (memory[addr+2] << 16) | (memory[addr+3] << 24))
+		val = (val + 1) & 0xFFFFFFFF
+		memory[addr]   = val & 0xFF
+		memory[addr+1] = (val >> 8)  & 0xFF
+		memory[addr+2] = (val >> 16) & 0xFF
+		memory[addr+3] = (val >> 24) & 0xFF
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 7 — POWERSHELL ТЕРМИНАЛ
+# ══════════════════════════════════════════════════════════════
+
+func _open_powershell() -> void:
+	if ui_start_visible: _toggle_start_menu()
+	if ps_window and is_instance_valid(ps_window):
+		ps_window.grab_focus()
+		return
+
+	ps_window = Window.new()
+	ps_window.title     = L("powershell")
+	ps_window.size      = Vector2i(680, 440)
+	ps_window.position  = Vector2i(80, 80)
+	add_child(ps_window)
+	ps_window.popup()
+
+	var bg : Panel = Panel.new()
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var bg_style : StyleBoxFlat = StyleBoxFlat.new()
+	bg_style.bg_color = Color(0.004, 0.141, 0.337)
+	bg.add_theme_stylebox_override("panel", bg_style)
+	ps_window.add_child(bg)
+
+	var vbox : VBoxContainer = VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.add_theme_constant_override("separation", 0)
+	bg.add_child(vbox)
+
+	ps_text = RichTextLabel.new()
+	ps_text.bbcode_enabled     = false
+	ps_text.scroll_following   = true
+	ps_text.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	ps_text.add_theme_color_override("default_color", Color(1, 1, 1))
+	ps_text.add_theme_font_size_override("normal_font_size", 13)
+	vbox.add_child(ps_text)
+
+	ps_input = LineEdit.new()
+	ps_input.placeholder_text = "Введите команду..."
+	ps_input.custom_minimum_size = Vector2(0, 30)
+	ps_input.add_theme_color_override("font_color", Color(1, 1, 1))
+	var input_style : StyleBoxFlat = StyleBoxFlat.new()
+	input_style.bg_color = Color(0.02, 0.10, 0.25)
+	ps_input.add_theme_stylebox_override("normal", input_style)
+	vbox.add_child(ps_input)
+	ps_input.text_submitted.connect(_ps_on_enter)
+
+	ps_output_buf = ""
+	_ps_print(L("ps_banner"))
+	ps_input.grab_focus()
+
+func _ps_print(text: String) -> void:
+	ps_output_buf += text
+	if ps_text and is_instance_valid(ps_text):
+		ps_text.text = ps_output_buf
+
+func _ps_on_enter(cmd_raw: String) -> void:
+	var cmd : String = cmd_raw.strip_edges()
+	ps_input.clear()
+	_ps_print(cmd + "\n")
+
+	if ps_waiting_yn:
+		var c : String = cmd.to_upper()
+		if c in ["Y", "Д"]:
+			_ps_print("[PC9] Открываем проводник...\n")
+			ps_waiting_yn = false
+			loader_open_file_dialog()
+		elif c in ["N", "Н"]:
+			_ps_print("[PC9] Отмена.\n")
+			ps_waiting_yn = false
+		else:
+			_ps_print("Введите Y или N: ")
+		return
+
+	var cmd_up : String = cmd.to_upper()
+
+	# PC9: сначала пробуем расширенные команды (демо/отладка)
+	if _ps_extended_command(cmd_up):
+		_ps_print("\nPS C:\\PC9> ")
+		return
+
+	match cmd_up:
+		"RUN", "LOAD", "GAME", "START GAME":
+			_ps_print("Открыть проводник для выбора .COM/.EXE? (Y/N): ")
+			ps_waiting_yn = true
+		"REGS":
+			var r : Dictionary = cpu_regs
+			var s : Dictionary = cpu_segs
+			_ps_print("AX=%04X BX=%04X CX=%04X DX=%04X\n" % [r["AX"],r["BX"],r["CX"],r["DX"]])
+			_ps_print("SI=%04X DI=%04X SP=%04X BP=%04X\n" % [r["SI"],r["DI"],r["SP"],r["BP"]])
+			_ps_print("CS=%04X DS=%04X SS=%04X ES=%04X\n" % [s["CS"],s["DS"],s["SS"],s["ES"]])
+			_ps_print("IP=%04X  HALT=%s\n" % [cpu_ip, str(cpu_halt)])
+		"FLAGS":
+			_ps_print("CF=%d ZF=%d SF=%d OF=%d PF=%d IF=%d DF=%d AF=%d\n" % [
+				cpu_flags["CF"], cpu_flags["ZF"], cpu_flags["SF"],
+				cpu_flags["OF"], cpu_flags["PF"], cpu_flags["IF"],
+				cpu_flags["DF"], cpu_flags["AF"]])
+		"STOP":
+			emu_running = false
+			cpu_halt    = true
+			_ps_print("[PC9] Эмулятор остановлен.\n")
+		"RESET":
+			cpu_halt    = true
+			emu_running = false
+			for k in cpu_regs.keys(): cpu_regs[k] = 0
+			cpu_regs["SP"] = 0xFFFE
+			cpu_ip = 0x0100
+			_ps_print("[PC9] Сброс процессора.\n")
+		"MEMTEST":
+			_ps_print("[PC9] ОЗУ: %d KB / %d KB\n" % [
+				memory.size() / 1024, RAM_SIZE / 1024])
+		"CLS":
+			ps_output_buf = ""
+			if ps_text: ps_text.text = ""
+		"HELP", "?":
+			_ps_print(
+				"Команды:\n"
+				+ "  RUN / LOAD  — загрузить .COM или .EXE файл\n"
+				+ "  REGS        — показать регистры CPU\n"
+				+ "  FLAGS       — показать флаги CPU\n"
+				+ "  STOP        — остановить эмулятор\n"
+				+ "  RESET       — сбросить CPU\n"
+				+ "  MEMTEST     — проверить ОЗУ\n"
+				+ "  CLS         — очистить экран\n"
+				+ "  DEMO HELLO  — демо Hello World\n"
+				+ "  DEMO CGA    — демо заполнения CGA-экрана\n"
+				+ "  DUMP REGS / STACK / MEM / VRAM — отладочные дампы\n"
+				+ "  DISASM      — мини-дизассемблер с текущего IP\n"
+				+ "  CPU INFO    — сведения о процессоре\n"
+				+ "  TIMER       — показать тики системного таймера\n"
+				+ "  HELP / ?    — эта справка\n"
+			)
+		"":
+			pass
+		_:
+			_ps_print("Команда не распознана: '%s'\nВведите HELP для справки.\n" % cmd)
+
+	_ps_print("\nPS C:\\PC9> ")
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 8 — CGA ОКНО
+# ══════════════════════════════════════════════════════════════
+
+func _open_cga_window() -> void:
+	if ui_start_visible: _toggle_start_menu()
+	if cga_window and is_instance_valid(cga_window):
+		cga_window.grab_focus()
+		return
+
+	cga_window = Window.new()
+	cga_window.title    = "PC9 — CGA Display 320×200"
+	cga_window.size     = Vector2i(CGA_W * 2, CGA_H * 2 + 24)
+	cga_window.position = Vector2i(200, 100)
+	add_child(cga_window)
+	cga_window.popup()
+
+	var bg : Panel = Panel.new()
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var bg_style : StyleBoxFlat = StyleBoxFlat.new()
+	bg_style.bg_color = Color(0, 0, 0)
+	bg.add_theme_stylebox_override("panel", bg_style)
+	cga_window.add_child(bg)
+
+	cga_init(bg)
+	cga_render()
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 9 — ЭМУЛЯТОР: ОСНОВНОЙ ЦИКЛ
+# ══════════════════════════════════════════════════════════════
+var emu_running      : bool  = false
+var emu_steps_budget : int   = 3000
+var emu_frame_ms     : float = 0.0
+const EMU_FRAME_INTERVAL : float = 0.0167   # ~60 Гц обновление экрана/звука
+
+func _run_game() -> void:
+	if ui_start_visible: _toggle_start_menu()
+	loader_open_file_dialog()
+
+func _start_emulation() -> void:
+	emu_running = true
+	_open_cga_window()
+
+func _process(delta: float) -> void:
+	# PC9: звук обновляется каждый кадр независимо от состояния CPU,
+	# чтобы не было щелчков/обрывов в AdLib-плеере
+	adlib_update_audio()
+
+	if not emu_running or cpu_halt:
+		if cpu_halt and emu_running:
+			emu_running = false
+			print("[EMU] Программа остановлена.")
+		return
+
+	emu_frame_ms += delta
+	if emu_frame_ms < EMU_FRAME_INTERVAL:
+		return
+	emu_frame_ms = 0.0
+
+	for _i in range(emu_steps_budget):
+		if cpu_halt: break
+		cpu_step()
+
+	if cga_window and is_instance_valid(cga_window):
+		cga_render()
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 10 — КЛАВИАТУРА
+# ══════════════════════════════════════════════════════════════
+
+const KEY_MAP : Dictionary = {
+	KEY_SPACE:     [0x20, 0x39],
+	KEY_ENTER:     [0x0D, 0x1C],
+	KEY_ESCAPE:    [0x1B, 0x01],
+	KEY_BACKSPACE: [0x08, 0x0E],
+	KEY_TAB:       [0x09, 0x0F],
+	KEY_UP:        [0x00, 0x48],
+	KEY_DOWN:      [0x00, 0x50],
+	KEY_LEFT:      [0x00, 0x4B],
+	KEY_RIGHT:     [0x00, 0x4D],
+	KEY_F1:        [0x00, 0x3B],
+	KEY_F2:        [0x00, 0x3C],
+	KEY_F3:        [0x00, 0x3D],
+	KEY_F4:        [0x00, 0x3E],
+	KEY_F5:        [0x00, 0x3F],
+	KEY_F10:       [0x00, 0x44],
+}
+
+func _input(event: InputEvent) -> void:
+	if not event is InputEventKey: return
+	if not event.pressed: return
+	var e : InputEventKey = event as InputEventKey
+	if KEY_MAP.has(e.keycode):
+		cpu_keyboard_buf.append(KEY_MAP[e.keycode])
+	elif e.unicode > 0:
+		var c : int = e.unicode & 0x7F
+		cpu_keyboard_buf.append([c, c])
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 11 — ОТЛАДЧИК И ДИЗАССЕМБЛЕР (упрощённый)
+# ══════════════════════════════════════════════════════════════
+
+func debug_dump_regs() -> String:
+	var r : Dictionary = cpu_regs
+	var s : Dictionary = cpu_segs
+	var f : Dictionary = cpu_flags
+	return (
+		"=== CPU STATE ===\n"
+		+ "AX=%04X  BX=%04X  CX=%04X  DX=%04X\n" % [r["AX"],r["BX"],r["CX"],r["DX"]]
+		+ "SI=%04X  DI=%04X  SP=%04X  BP=%04X\n" % [r["SI"],r["DI"],r["SP"],r["BP"]]
+		+ "CS=%04X  DS=%04X  SS=%04X  ES=%04X\n" % [s["CS"],s["DS"],s["SS"],s["ES"]]
+		+ "IP=%04X  HALT=%s\n" % [cpu_ip, str(cpu_halt)]
+		+ "CF=%d ZF=%d SF=%d OF=%d PF=%d IF=%d DF=%d AF=%d\n" % [
+			f["CF"],f["ZF"],f["SF"],f["OF"],f["PF"],f["IF"],f["DF"],f["AF"]]
+	)
+
+func debug_dump_stack(count: int = 8) -> String:
+	var out : String = "=== STACK (SS:%04X) ===\n" % cpu_segs["SS"]
+	var sp  : int    = cpu_regs["SP"]
+	for i in range(count):
+		var off  : int = (sp + i * 2) & 0xFFFF
+		var val  : int = cpu_rw("SS", off)
+		var mark : String = " <-- SP" if i == 0 else ""
+		out += "  [%04X] = %04X%s\n" % [off, val, mark]
+	return out
+
+func debug_dump_mem(seg: int, off: int, count: int = 64) -> String:
+	var out  : String = "=== MEM %04X:%04X ===\n" % [seg, off]
+	var base : int    = mem_get_phys(seg, off)
+	var i    : int    = 0
+	while i < count:
+		var line : String = "%04X: " % (off + i)
+		var chars : String = ""
+		for j in range(16):
+			if i + j >= count: break
+			var b : int = memory[base + i + j] if base + i + j < RAM_SIZE else 0
+			line  += "%02X " % b
+			chars += char(b) if b >= 0x20 and b < 0x7F else "."
+		out += line + " " + chars + "\n"
+		i += 16
+	return out
+
+func disasm_at(seg: int, off: int, lines: int = 10) -> String:
+	var out  : String = "=== DISASM %04X:%04X ===\n" % [seg, off]
+	var base : int    = mem_get_phys(seg, off)
+	var pos  : int    = 0
+	for _l in range(lines):
+		if base + pos >= RAM_SIZE: break
+		var b    : int    = memory[base + pos]
+		var mnem : String = _disasm_mnem(b)
+		out += "%04X: %02X  %s\n" % [off + pos, b, mnem]
+		pos += 1
+	return out
+
+func _disasm_mnem(op: int) -> String:
+	match op:
+		0x90: return "NOP"
+		0xF4: return "HLT"
+		0xCD: return "INT  imm8"
+		0xE8: return "CALL near"
+		0xC3: return "RET"
+		0xCB: return "RETF"
+		0xEB: return "JMP  short"
+		0xE9: return "JMP  near"
+		0xEA: return "JMP  far"
+		0xCF: return "IRET"
+		0xF8: return "CLC"
+		0xF9: return "STC"
+		0xFA: return "CLI"
+		0xFB: return "STI"
+		0xFC: return "CLD"
+		0xFD: return "STD"
+		0x6A: return "PUSH imm8"
+		0x68: return "PUSH imm16"
+		0xC8: return "ENTER imm16, imm8"
+		0xC9: return "LEAVE"
+		0x37: return "AAA"
+		0x2F: return "DAS"
+		0x62: return "BOUND reg, mem"
+		0x50,0x51,0x52,0x53,0x54,0x55,0x56,0x57:
+			return "PUSH " + REG16[op & 7]
+		0x58,0x59,0x5A,0x5B,0x5C,0x5D,0x5E,0x5F:
+			return "POP  " + REG16[op & 7]
+		0xB8,0xB9,0xBA,0xBB,0xBC,0xBD,0xBE,0xBF:
+			return "MOV  " + REG16[op & 7] + ", imm16"
+		0xB0,0xB1,0xB2,0xB3,0xB4,0xB5,0xB6,0xB7:
+			return "MOV  " + REG8[op & 7] + ", imm8"
+		0x88: return "MOV  r/m8, reg8"
+		0x89: return "MOV  r/m16, reg16"
+		0x8A: return "MOV  reg8, r/m8"
+		0x8B: return "MOV  reg16, r/m16"
+		0xA1: return "MOV  AX, [mem16]"
+		0xA3: return "MOV  [mem16], AX"
+		0xE2: return "LOOP rel8"
+		0xE0: return "LOOPNZ rel8"
+		0xE1: return "LOOPZ rel8"
+		0xE3: return "JCXZ rel8"
+		0xF3: return "REP ..."
+		0xF2: return "REPNE ..."
+		0xA4: return "MOVSB"
+		0xA5: return "MOVSW"
+		0xAA: return "STOSB"
+		0xAB: return "STOSW"
+		0xAC: return "LODSB"
+		0xAD: return "LODSW"
+		0xAE: return "SCASB"
+		0x98: return "CBW"
+		0x99: return "CWD"
+		0xD7: return "XLAT"
+		0x9C: return "PUSHF"
+		0x9D: return "POPF"
+		0x9E: return "SAHF"
+		0x9F: return "LAHF"
+		0xCC: return "INT  3"
+		0xCE: return "INTO"
+		_:
+			if op >= 0x70 and op <= 0x7F:
+				var jcc_names : Array[String] = [
+					"JO","JNO","JB","JNB","JE","JNE","JBE","JA",
+					"JS","JNS","JP","JNP","JL","JNL","JLE","JG"
+				]
+				return jcc_names[op - 0x70] + " rel8"
+			if op >= 0x40 and op <= 0x47: return "INC  " + REG16[op & 7]
+			if op >= 0x48 and op <= 0x4F: return "DEC  " + REG16[op & 7]
+			return "??   (0x%02X)" % op
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 12 — ТЕСТОВЫЕ COM-ПРОГРАММЫ (встроенные примеры)
+# ══════════════════════════════════════════════════════════════
+
+func demo_load_hello_world() -> void:
+	# Минимальная .COM программа: выводит "Hello, PC9!" через INT 21h
+	var prog : PackedByteArray = PackedByteArray([
+		0xB4, 0x09,        # MOV AH, 09h
+		0xBA, 0x08, 0x01,  # MOV DX, 0x0108  (смещение строки в COM)
+		0xCD, 0x21,        # INT 21h
+		0xCD, 0x20,        # INT 20h
+		0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x2C,   # "Hello,"
+		0x20, 0x50, 0x43, 0x39, 0x21,          # " PC9!"
+		0x24                                    # '$'
+	])
+
+	var seg  : int = LOAD_SEGMENT
+	loader_create_psp(seg, "HELLO.COM")
+	var base : int = (seg << 4) + PSP_SIZE
+	for i in range(prog.size()):
+		if base + i < RAM_SIZE:
+			memory[base + i] = prog[i]
+
+	cpu_segs["CS"] = seg; cpu_segs["DS"] = seg
+	cpu_segs["ES"] = seg; cpu_segs["SS"] = seg
+	cpu_ip         = 0x0100
+	cpu_regs["SP"] = 0xFFFE
+	cpu_halt       = false
+	_ps_print("[DEMO] Hello World загружен.\n")
+
+func demo_load_cga_fill() -> void:
+	# COM-программа: заполняет видеопамять шаблоном (CGA-тест)
+	var prog : PackedByteArray = PackedByteArray([
+		0xB8, 0x00, 0xB8,   # MOV AX, 0xB800
+		0x8E, 0xC0,         # MOV ES, AX
+		0x33, 0xFF,         # XOR DI, DI
+		0xB9, 0x00, 0x20,   # MOV CX, 0x2000  (8192 слова = 16384 байт)
+		0xB8, 0xAA, 0xAA,   # MOV AX, 0xAAAA  (чередующиеся пиксели)
+		0xF3, 0xAB,         # REP STOSW
+		0xCD, 0x20,         # INT 20h
+	])
+
+	var seg  : int = LOAD_SEGMENT
+	loader_create_psp(seg, "CGAFILL.COM")
+	var base : int = (seg << 4) + PSP_SIZE
+	for i in range(prog.size()):
+		if base + i < RAM_SIZE:
+			memory[base + i] = prog[i]
+
+	cpu_segs["CS"] = seg; cpu_segs["DS"] = seg
+	cpu_segs["ES"] = seg; cpu_segs["SS"] = seg
+	cpu_ip         = 0x0100
+	cpu_regs["SP"] = 0xFFFE
+	cpu_halt       = false
+	_ps_print("[DEMO] CGA Fill загружен.\n")
+
+func _ps_demo_command(cmd_up: String) -> bool:
+	match cmd_up:
+		"DEMO HELLO":
+			demo_load_hello_world()
+			_start_emulation()
+			return true
+		"DEMO CGA":
+			demo_load_cga_fill()
+			_start_emulation()
+			return true
+		"DUMP REGS":
+			_ps_print(debug_dump_regs())
+			return true
+		"DUMP STACK":
+			_ps_print(debug_dump_stack(8))
+			return true
+		"DISASM":
+			_ps_print(disasm_at(cpu_segs["CS"], cpu_ip, 12))
+			return true
+	return false
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 13 — ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ
+# ══════════════════════════════════════════════════════════════
+
+func hex_to_bytes(hex_str: String) -> PackedByteArray:
+	var result : PackedByteArray = PackedByteArray()
+	var s      : String = hex_str.replace(" ", "").replace("\n", "").to_upper()
+	var i      : int    = 0
+	while i + 1 < s.length():
+		var hi  : int = _hex_nibble(s[i])
+		var lo  : int = _hex_nibble(s[i + 1])
+		if hi < 0 or lo < 0: i += 2; continue
+		result.append((hi << 4) | lo)
+		i += 2
+	return result
+
+func _hex_nibble(c: String) -> int:
+	if c >= "0" and c <= "9": return c.unicode_at(0) - 0x30
+	if c >= "A" and c <= "F": return c.unicode_at(0) - 0x37
+	return -1
+
+func byte_to_bin(b: int) -> String:
+	var s : String = ""
+	for i in range(7, -1, -1):
+		s += "1" if (b >> i) & 1 else "0"
+	return s
+
+func mem_checksum(start: int, length: int) -> int:
+	var sum : int = 0
+	for i in range(length):
+		if start + i < RAM_SIZE:
+			sum = (sum + memory[start + i]) & 0xFFFF
+	return sum
+
+func mem_find(pattern: PackedByteArray, start: int = 0) -> int:
+	var plen : int = pattern.size()
+	if plen == 0: return -1
+	for i in range(start, RAM_SIZE - plen):
+		var found : bool = true
+		for j in range(plen):
+			if memory[i + j] != pattern[j]:
+				found = false
+				break
+		if found: return i
+	return -1
+
+func mem_copy(src: int, dst: int, count: int) -> void:
+	if src == dst: return
+	for i in range(count):
+		if src + i < RAM_SIZE and dst + i < RAM_SIZE:
+			memory[dst + i] = memory[src + i]
+
+func mem_fill(start: int, count: int, val: int) -> void:
+	for i in range(count):
+		if start + i < RAM_SIZE:
+			memory[start + i] = val & 0xFF
+
+# ══════════════════════════════════════════════════════════════
+#  БЛОК 14 — РАСШИРЕНИЕ POWERSHELL: дополнительные команды
+# ══════════════════════════════════════════════════════════════
+
+func _ps_extended_command(cmd: String) -> bool:
+	var up : String = cmd.to_upper().strip_edges()
+	if _ps_demo_command(up): return true
+	match up:
+		"DUMP MEM":
+			_ps_print(debug_dump_mem(cpu_segs["DS"], 0, 128))
+			return true
+		"DUMP VRAM":
+			var crc : int = mem_checksum(CGA_VRAM, 16384)
+			_ps_print("[VRAM] Checksum: %04X\n" % crc)
+			return true
+		"CPU INFO":
+			_ps_print(
+				"Intel 8086 Emulator — PC9 v2.0\n"
+				+ "Опкодов поддержано: 110+\n"
+				+ "ОЗУ: %d KB\n" % (RAM_SIZE / 1024)
+				+ "CGA VRAM @ 0x%05X\n" % CGA_VRAM
+				+ "Звуковая карта: AdLib OPL2 (порты 0x388/0x389)\n"
+				+ "Загрузочный сегмент: 0x%04X\n" % LOAD_SEGMENT
+			)
+			return true
+		"TIMER":
+			var t : int = (memory[TIMER_ADDR]
+				| (memory[TIMER_ADDR+1] << 8)
+				| (memory[TIMER_ADDR+2] << 16)
+				| (memory[TIMER_ADDR+3] << 24))
+			_ps_print("[BIOS] Tick counter: %d (%.2f сек)\n" % [t, t / 18.2])
+			return true
+	return false
+
+# ══════════════════════════════════════════════════════════════
+#  ФИНАЛ — версия и лицензия
+# ══════════════════════════════════════════════════════════════
+# PC9 — Radchenko Windows 82
+# GDScript-порт для Godot 4 Engine
+# Автор оригинала: Никита Радченко
+# Архитектура: один файл-скрипт, Control-узел
+#
+# Компоненты:
+#   CPU8086     — 110+ опкодов Intel 8086 + новые (PUSH imm,
+#                 ENTER/LEAVE, AAA/DAS, BOUND)
+#   MemoryBus   — 1 МБ ОЗУ, PackedByteArray, безопасный доступ
+#   DOSKernel   — INT 21h/20h/10h/11h/12h/15h/16h/1Ah
+#   CGADisplay  — 320×200, 4 цвета, интерлейсинг, ImageTexture
+#   AdLib/OPL2  — звуковая карта, FM-синтез, 9 каналов
+#   DOSLoader   — .COM и .EXE (MZ + релокация)
+#   DesktopUI   — рабочий стол, панель, иконки, меню Пуск
+#   PowerShell  — встроенный терминал с расширенными командами
+#   Debugger    — дамп регистров, стека, памяти, дизассемблер
+#   Demos       — встроенные Hello World и CGA Fill
+#
+# Использование:
+#   1. Control-узел на весь экран
+#   2. Прикрепить этот скрипт
+#   3. Запустить сцену
+#   4. В PowerShell: RUN (загрузить .COM/.EXE)
+#      или DEMO HELLO / DEMO CGA для встроенных демо
+# =============================================================
